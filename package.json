@@ -1,0 +1,22 @@
+{
+"name": "titan-flash-engine",
+"version": "207.0.0",
+"description": "Apex Predator - Gem Finder & Absolute Finality Engine",
+"main": "server.js",
+"scripts": {
+"start": "node server.js",
+"setup": "npm install"
+},
+"dependencies": {
+"ethers": "^6.10.0",
+"axios": "^1.6.0",
+"sentiment": "^5.0.2",
+"dotenv": "^16.4.1",
+"colors": "^1.4.0",
+"telegram": "^2.22.2",
+"input": "^1.0.1"
+},
+"engines": {
+"node": ">=18.0.0"
+}
+}
