@@ -8,8 +8,6 @@ use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
 use petgraph::{graph::{NodeIndex, UnGraph}, visit::EdgeRef};
 use std::{sync::Arc, collections::HashMap, str::FromStr, net::TcpListener, io::{self, Write}, thread, time::Duration};
 use colored::*;
-// FIXED: Using the crate name explicitly
-extern crate dotenv;
 use dotenv::dotenv;
 use std::env;
 use anyhow::{Result, anyhow};
@@ -18,7 +16,6 @@ use log::{info, error};
 use futures_util::StreamExt;
 use tokio::sync::Mutex;
 
-// GLOBAL LOCK: Threads will wait here and handshake one-by-one
 lazy_static::lazy_static! {
     static ref HANDSHAKE_LOCK: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 }
@@ -56,7 +53,7 @@ async fn main() {
     
     println!("{}", "╔════════════════════════════════════════════════════════╗".yellow());
     println!("{}", "║    ⚡ APEX OMEGA: SEQUENTIAL SINGULARITY (V4.2.1)   ║".yellow());
-    println!("{}", "║    STATUS: BUILD ERRORS FIXED | READY TO HUNT       ║".yellow());
+    println!("{}", "║    STATUS: IMPORTS FIXED | COMPILATION READY        ║".yellow());
     println!("{}", "╚════════════════════════════════════════════════════════╝".yellow());
     let _ = io::stdout().flush();
 
@@ -91,9 +88,7 @@ async fn start_bot() -> Result<()> {
         handles.push(tokio::spawn(async move {
             let mut backoff = 15;
             loop {
-                // SEQUENTIAL LOCK
                 let _lock = HANDSHAKE_LOCK.lock().await;
-                
                 let mut url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc.clone());
                 if url.contains("infura.io") && !url.contains("/ws/") { url = url.replace(".io/v3/", ".io/ws/v3/"); }
 
@@ -102,7 +97,7 @@ async fn start_bot() -> Result<()> {
                     Err(e) => {
                         let err_msg = format!("{:?}", e);
                         if err_msg.contains("429") || err_msg.contains("-32005") {
-                            error!("[{}] RATE LIMIT BANNED. Cool down 5m.", config.name);
+                            error!("[{}] RATE LIMITED. Cool down 5m.", config.name);
                             tokio::time::sleep(Duration::from_secs(300)).await;
                         } else {
                             error!("[{}] Failed: {}. Backoff {}s", config.name, err_msg, backoff);
@@ -115,17 +110,15 @@ async fn start_bot() -> Result<()> {
         }));
     }
 
-    // FIXED: Using futures_util instead of futures
-    futures_util::future::join_all(handles).await;
+    // FIXED: Using the standard futures crate call
+    futures::future::join_all(handles).await;
     Ok(())
 }
 
 async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_url: String) -> Result<()> {
     info!("[{}] Handshaking...", config.name);
-    
     let provider = tokio::time::timeout(Duration::from_secs(45), Provider::<Ws>::connect(&rpc_url))
         .await.map_err(|_| anyhow!("Handshake Timeout"))??;
-    
     let provider = Arc::new(provider);
     let wallet: LocalWallet = pk.parse()?;
     let chain_id = provider.get_chainid().await?.as_u64();
@@ -157,9 +150,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
     let mut stream = provider.subscribe_logs(&filter).await?;
 
     loop {
-        let log_result = tokio::time::timeout(Duration::from_secs(60), stream.next()).await;
-        
-        match log_result {
+        match tokio::time::timeout(Duration::from_secs(60), stream.next()).await {
             Ok(Some(log)) => {
                 if let Some(edge_idx) = pair_map.get(&log.address) {
                     if let Some(edge) = graph.edge_weight_mut(*edge_idx) {
@@ -168,9 +159,8 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
                             edge.reserve_1 = U256::from_big_endian(&log.data[32..64]);
                         }
                     }
-
-                    let weth_str = if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" };
-                    let weth = Address::from_str(weth_str)?;
+                    let weth_s = if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" };
+                    let weth = Address::from_str(weth_s)?;
                     if let Some(start) = node_map.get(&weth) {
                         if let Some((profit, route)) = find_arb_recursive(&graph, *start, *start, parse_ether("1.0")?, 4, vec![]) {
                             if profit > parse_ether("0.01")? {
@@ -178,12 +168,11 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
                                 let strategy = build_strategy(route, parse_ether("1.0")?, profit * 90 / 100, executor.address(), &graph)?;
                                 let mut tx = executor.execute(U256::zero(), weth, parse_ether("1.0")?, strategy).tx;
                                 let _ = client.fill_transaction(&mut tx, None).await;
-
                                 if let Ok(sig) = client.signer().sign_transaction(&tx).await {
                                     let rlp = tx.rlp_signed(&sig);
                                     if let Some(fb) = fb_client.as_ref() {
-                                        let block = provider.get_block_number().await.unwrap_or_default();
-                                        let bundle = BundleRequest::new().push_transaction(rlp).set_block(block + 1);
+                                        let b = provider.get_block_number().await.unwrap_or_default();
+                                        let bundle = BundleRequest::new().push_transaction(rlp).set_block(b + 1);
                                         let fb_cl = fb.clone();
                                         tokio::spawn(async move { let _ = fb_cl.send_bundle(&bundle).await; });
                                     } else {
