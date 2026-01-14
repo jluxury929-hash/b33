@@ -1,6 +1,6 @@
 use ethers::{
     prelude::*,
-    providers::{Provider, Ws, Http},
+    providers::{Provider, Ws},
     utils::{parse_ether, format_ether},
     abi::{Token, encode},
 };
@@ -12,9 +12,10 @@ use dotenv::dotenv;
 use std::env;
 use anyhow::{Result, anyhow};
 use url::Url;
-use log::{info, error};
+use log::{info, error, warn};
 use futures_util::StreamExt;
 
+// --- DATA STRUCTURES ---
 #[derive(Clone, Debug)]
 struct ChainConfig {
     name: String,
@@ -49,12 +50,13 @@ struct PoolEdge {
 
 #[tokio::main]
 async fn main() {
+    // 1. INITIALIZE LOGGING
     dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
     println!("{}", "╔════════════════════════════════════════════════════════╗".yellow());
     println!("{}", "║    ⚡ APEX OMEGA: QUAD-NETWORK SINGULARITY           ║".yellow());
-    println!("{}", "║    STATUS: ENGINES READY | DYNAMIC RPC SUPPORT        ║".yellow());
+    println!("{}", "║    STATUS: STARTING ENGINES WITH AUTO-RECONNECT      ║".yellow());
     println!("{}", "╚════════════════════════════════════════════════════════╝".yellow());
     let _ = io::stdout().flush();
 
@@ -66,7 +68,9 @@ async fn main() {
 }
 
 async fn start_bot() -> Result<()> {
-    // Railway Health Monitor
+    validate_env()?;
+
+    // 2. RAILWAY HEALTH MONITOR (Port 8080)
     thread::spawn(|| {
         let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
         for stream in listener.incoming() {
@@ -93,13 +97,26 @@ async fn start_bot() -> Result<()> {
 
     let mut handles = vec![];
     for config in chains {
-        let pk = env::var("PRIVATE_KEY").expect("PRIVATE_KEY missing");
-        let exec = env::var("EXECUTOR_ADDRESS").expect("EXECUTOR_ADDRESS missing");
+        let pk = env::var("PRIVATE_KEY")?;
+        let exec = env::var("EXECUTOR_ADDRESS")?;
+        
         handles.push(tokio::spawn(async move {
+            let mut retry_delay = 5; 
             loop {
-                if let Err(e) = monitor_chain(config.clone(), pk.clone(), exec.clone()).await {
-                    error!("[{}] Engine crashed: {:?}. Reconnecting...", config.name, e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                // AUTO-FIX INFURA URLS (The "HTTP 200 OK" Fix)
+                let mut url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc.clone());
+                if url.contains("infura.io") && !url.contains("/ws/") {
+                    url = url.replace(".io/v3/", ".io/ws/v3/");
+                }
+
+                if let Err(e) = monitor_chain(config.clone(), pk.clone(), exec.clone(), url).await {
+                    error!("[{}] Engine Crashed: {:?}. Retrying in {}s...", config.name, e, retry_delay);
+                    tokio::time::sleep(Duration::from_secs(retry_delay)).await;
+                    
+                    // Exponential backoff (The "429 Too Many Requests" Fix)
+                    retry_delay = std::cmp::min(retry_delay * 2, 60);
+                } else {
+                    retry_delay = 5; 
                 }
             }
         }));
@@ -109,20 +126,14 @@ async fn start_bot() -> Result<()> {
     Ok(())
 }
 
-async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Result<()> {
-    let rpc_url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc.clone());
-    info!("[{}] Connecting to RPC...", config.name);
+async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_url: String) -> Result<()> {
+    info!("[{}] Connecting to WS...", config.name);
 
-    // FIXED: Use a trait object to handle both WS and HTTP types
-    let provider: Arc<Provider<Ws>> = if rpc_url.starts_with("wss://") || rpc_url.starts_with("ws://") {
-        Arc::new(Provider::<Ws>::connect(&rpc_url).await?)
-    } else {
-        return Err(anyhow!("Log streaming requires a WebSocket (wss://) URL. {} is not compatible.", rpc_url));
-    };
-
+    let provider = Provider::<Ws>::connect(&rpc_url).await?;
+    let provider = Arc::new(provider);
     let wallet: LocalWallet = pk.parse()?;
     let chain_id = provider.get_chainid().await?.as_u64();
-    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.with_chain_id(chain_id)));
+    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.clone().with_chain_id(chain_id)));
 
     let fb_client = if !config.flashbots_relay.is_empty() {
         let fb_signer: LocalWallet = "0000000000000000000000000000000000000000000000000000000000000001".parse()?;
@@ -138,7 +149,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
     let mut node_map: HashMap<Address, NodeIndex> = HashMap::new();
     let mut pair_map: HashMap<Address, petgraph::graph::EdgeIndex> = HashMap::new();
 
-    // Load initial pool
+    // Initial load for WETH/USDC (Example)
     let pool_addr = Address::from_str("0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc")?;
     let pair = IUniswapV2Pair::new(pool_addr, provider.clone());
     let (r0, r1, _) = pair.get_reserves().call().await?;
@@ -164,7 +175,9 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                 }
             }
 
-            let weth = Address::from_str("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")?;
+            let weth_addr = if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" };
+            let weth = Address::from_str(weth_addr)?;
+            
             if let Some(start) = node_map.get(&weth) {
                 let amt_in = parse_ether("1.0")?;
                 if let Some((profit, route)) = find_arb_recursive(&graph, *start, *start, amt_in, 4, vec![]) {
@@ -172,9 +185,10 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                         info!("[{}] 💎 PROFIT: {} ETH", config.name, format_ether(profit));
                         let bribe = profit * 90 / 100;
                         let strategy = build_strategy(route, amt_in, bribe, executor.address(), &graph)?;
+
                         let mut tx = executor.execute(U256::zero(), weth, amt_in, strategy).tx;
-                        
                         let _ = client.fill_transaction(&mut tx, None).await;
+
                         if let Ok(sig) = client.signer().sign_transaction(&tx).await {
                              let rlp = tx.rlp_signed(&sig);
                              if let Some(fb) = fb_client.as_ref() {
@@ -192,7 +206,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
             }
         }
     }
-    Ok(())
+    Err(anyhow!("Stream disconnected"))
 }
 
 async fn saturation_strike(rpc_url: &str, signed_rlp: Bytes) {
@@ -203,6 +217,13 @@ async fn saturation_strike(rpc_url: &str, signed_rlp: Bytes) {
         let body = serde_json::json!({"jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": [raw_tx_hex], "id": 1});
         let _ = client_http.post(rpc).json(&body).send().await;
     });
+    info!("🚀 Saturation Strike Sent");
+}
+
+fn validate_env() -> Result<()> {
+    let _ = env::var("PRIVATE_KEY").map_err(|_| anyhow!("PRIVATE_KEY missing"))?;
+    let _ = env::var("EXECUTOR_ADDRESS").map_err(|_| anyhow!("EXECUTOR_ADDRESS missing"))?;
+    Ok(())
 }
 
 fn find_arb_recursive(graph: &UnGraph<Address, PoolEdge>, curr: NodeIndex, start: NodeIndex, amt: U256, depth: u8, path: Vec<(Address, Address)>) -> Option<(U256, Vec<(Address, Address)>)> {
@@ -211,6 +232,7 @@ fn find_arb_recursive(graph: &UnGraph<Address, PoolEdge>, curr: NodeIndex, start
         return if amt > initial { Some((amt - initial, path)) } else { None };
     }
     if depth == 0 { return None; }
+
     for edge in graph.edges(curr) {
         let next = edge.target();
         if path.iter().any(|(a, _)| *a == *graph.node_weight(next).unwrap()) && next != start { continue; }
@@ -237,31 +259,39 @@ fn build_strategy(route: Vec<(Address, Address)>, init_amt: U256, bribe: U256, c
     let mut targets = Vec::new();
     let mut payloads = Vec::new();
     let mut curr_in = init_amt;
+
     for (i, (tin, tout)) in route.iter().enumerate() {
-        let nin = graph.node_indices().find(|n| *graph.node_weight(*n).unwrap() == *tin).unwrap();
-        let nout = graph.node_indices().find(|n| *graph.node_weight(*n).unwrap() == *tout).unwrap();
+        let nin = graph.node_indices().find(|node| *graph.node_weight(*node).unwrap() == *tin).unwrap();
+        let nout = graph.node_indices().find(|node| *graph.node_weight(*node).unwrap() == *tout).unwrap();
         let edge = &graph[graph.find_edge(nin, nout).unwrap()];
+
         if i == 0 {
             targets.push(*tin);
             let d = ethers::abi::encode(&[Token::Address(edge.pair_address), Token::Uint(init_amt)]);
-            let mut data = vec![0xa9, 0x05, 0x9c, 0xbb]; data.extend(d);
+            let mut data = vec![0xa9, 0x05, 0x9c, 0xbb];
+            data.extend(d);
             payloads.push(Bytes::from(data));
         }
+
         let out = get_amount_out(curr_in, edge, nin, graph);
         let (a0, a1) = if *tin == edge.token_0 { (U256::zero(), out) } else { (out, U256::zero()) };
         let to = if i == route.len() - 1 { contract } else {
-            let n_next_out = graph.node_indices().find(|n| *graph.node_weight(*n).unwrap() == route[i+1].1).unwrap();
-            graph[graph.find_edge(nout, n_next_out).unwrap()].pair_address
+            let next_node_out = graph.node_indices().find(|node| *graph.node_weight(*node).unwrap() == route[i+1].1).unwrap();
+            graph[graph.find_edge(nout, next_node_out).unwrap()].pair_address
         };
+
         targets.push(edge.pair_address);
         let d = ethers::abi::encode(&[Token::Uint(a0), Token::Uint(a1), Token::Address(to), Token::Bytes(vec![])]);
-        let mut data = vec![0x02, 0x2c, 0x0d, 0x9f]; data.extend(d);
+        let mut data = vec![0x02, 0x2c, 0x0d, 0x9f];
+        data.extend(d);
         payloads.push(Bytes::from(data));
         curr_in = out;
     }
-    Ok(Bytes::from(encode(&[
+
+    let encoded = encode(&[
         Token::Array(targets.into_iter().map(Token::Address).collect()),
         Token::Array(payloads.into_iter().map(|b| Token::Bytes(b.to_vec())).collect()),
         Token::Uint(bribe),
-    ])))
+    ]);
+    Ok(Bytes::from(encoded))
 }
