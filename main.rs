@@ -14,10 +14,7 @@ use anyhow::{Result, anyhow};
 use url::Url;
 use log::{info, error, warn};
 use futures_util::StreamExt;
-use rand::Rng; 
-
-// --- CONFIGURATION ---
-const WETH_ADDR: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"; 
+use rand::Rng;
 
 #[derive(Clone, Debug)]
 struct ChainConfig {
@@ -25,21 +22,16 @@ struct ChainConfig {
     rpc_env_key: String,
     default_rpc: String,
     flashbots_relay: String,
+    stagger_delay: u64, // Staggered start to prevent 429s
 }
 
-abigen!(
-    IUniswapV2Pair,
-    r#"[
-        function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)
-        function token0() external view returns (address)
-        function token1() external view returns (address)
-    ]"#
-);
+abigen!(IUniswapV2Pair, r#"[
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)
+    function token0() external view returns (address)
+    function token1() external view returns (address)
+]"#);
 
-abigen!(
-    ApexOmega,
-    r#"[ function execute(uint256 mode, address token, uint256 amount, bytes calldata strategy) external payable ]"#
-);
+abigen!(ApexOmega, r#"[ function execute(uint256 mode, address token, uint256 amount, bytes calldata strategy) external payable ]"#);
 
 #[derive(Clone, Copy, Debug)]
 struct PoolEdge {
@@ -57,14 +49,14 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
     println!("{}", "╔════════════════════════════════════════════════════════╗".yellow());
-    println!("{}", "║    ⚡ APEX OMEGA: FINAL BATTLE EDITION (QUAD)       ║".yellow());
-    println!("{}", "║    STATUS: STAGGERED START | JITTER RECONNECT ACTIVE   ║".yellow());
+    println!("{}", "║    ⚡ APEX OMEGA: FINAL SINGULARITY (V4.1)          ║".yellow());
+    println!("{}", "║    STATUS: ANTI-BAN JITTER ACTIVE | QUAD-CORE       ║".yellow());
     println!("{}", "╚════════════════════════════════════════════════════════╝".yellow());
     let _ = io::stdout().flush();
 
     if let Err(e) = start_bot().await {
         error!("FATAL STARTUP ERROR: {:?}", e);
-        thread::sleep(Duration::from_secs(10));
+        thread::sleep(Duration::from_secs(60));
         std::process::exit(1);
     }
 }
@@ -72,7 +64,7 @@ async fn main() {
 async fn start_bot() -> Result<()> {
     validate_env()?;
 
-    // Railway Health Monitor
+    // Port 8080 Guard for Railway
     thread::spawn(|| {
         let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
         for stream in listener.incoming() {
@@ -81,40 +73,36 @@ async fn start_bot() -> Result<()> {
     });
 
     let chains = vec![
-        ChainConfig { name: "ETHEREUM".into(), rpc_env_key: "ETH_RPC".into(), default_rpc: "wss://mainnet.infura.io/ws/v3/e601dc0b8ff943619576956539dd3b82".into(), flashbots_relay: "https://relay.flashbots.net".into() },
-        ChainConfig { name: "BASE".into(), rpc_env_key: "BASE_RPC".into(), default_rpc: "wss://base-mainnet.infura.io/ws/v3/e601dc0b8ff943619576956539dd3b82".into(), flashbots_relay: "".into() },
-        ChainConfig { name: "ARBITRUM".into(), rpc_env_key: "ARB_RPC".into(), default_rpc: "wss://arbitrum-mainnet.infura.io/ws/v3/d266e88fdc0b4626bfa0d22f8fcf04d6".into(), flashbots_relay: "".into() },
+        ChainConfig { name: "ETHEREUM".into(), rpc_env_key: "ETH_RPC".into(), default_rpc: "wss://mainnet.infura.io/ws/v3/PROJECT_ID".into(), flashbots_relay: "https://relay.flashbots.net".into(), stagger_delay: 0 },
+        ChainConfig { name: "BASE".into(), rpc_env_key: "BASE_RPC".into(), default_rpc: "wss://base-mainnet.infura.io/ws/v3/PROJECT_ID".into(), flashbots_relay: "".into(), stagger_delay: 20 },
+        ChainConfig { name: "ARBITRUM".into(), rpc_env_key: "ARB_RPC".into(), default_rpc: "wss://arbitrum-mainnet.infura.io/ws/v3/PROJECT_ID".into(), flashbots_relay: "".into(), stagger_delay: 40 },
     ];
 
     let mut handles = vec![];
     for config in chains {
         let pk = env::var("PRIVATE_KEY")?;
         let exec = env::var("EXECUTOR_ADDRESS")?;
-        
         handles.push(tokio::spawn(async move {
-            let mut backoff_secs = 5;
+            if config.stagger_delay > 0 {
+                tokio::time::sleep(Duration::from_secs(config.stagger_delay)).await;
+            }
+            let mut backoff = 10;
             loop {
-                // 1. STAGGERED START: Each chain waits a random offset to prevent "Thundering Herd" on Infura
-                let jitter_ms = rand::thread_rng().gen_range(1000..5000);
-                tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
-
-                // 2. URL AUTO-FIX (Ensures /ws/ is present)
                 let mut url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc.clone());
-                if url.contains("infura.io") && !url.contains("/ws/") {
-                    url = url.replace(".io/v3/", ".io/ws/v3/");
-                }
+                if url.contains("infura.io") && !url.contains("/ws/") { url = url.replace(".io/v3/", ".io/ws/v3/"); }
 
-                // 3. ATTEMPT CONNECTION
                 match monitor_chain(config.clone(), pk.clone(), exec.clone(), url).await {
-                    Ok(_) => {
-                        warn!("[{}] Connection closed normally. Reconnecting...", config.name);
-                        backoff_secs = 5; // Reset backoff on successful run
-                    },
+                    Ok(_) => backoff = 10,
                     Err(e) => {
-                        error!("[{}] CRITICAL FAILURE: {:?}. Backing off for {}s", config.name, e, backoff_secs);
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                        // Exponential backoff capped at 2 minutes
-                        backoff_secs = std::cmp::min(backoff_secs * 2, 120);
+                        let err_msg = format!("{:?}", e);
+                        if err_msg.contains("429") || err_msg.contains("-32005") {
+                            error!("[{}] BANNED BY INFURA. Entering deep sleep (5m) to clear IP.", config.name);
+                            tokio::time::sleep(Duration::from_secs(300)).await;
+                        } else {
+                            error!("[{}] Error: {}. Backoff {}s", config.name, err_msg, backoff);
+                            tokio::time::sleep(Duration::from_secs(backoff)).await;
+                            backoff = std::cmp::min(backoff * 2, 60);
+                        }
                     }
                 }
             }
@@ -126,18 +114,11 @@ async fn start_bot() -> Result<()> {
 }
 
 async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_url: String) -> Result<()> {
-    info!("[{}] Attempting handshake with {}...", config.name, rpc_url);
-    
-    // Handshake Timeout: Prevent hanging on busy nodes
-    let provider = tokio::time::timeout(
-        Duration::from_secs(15), 
-        Provider::<Ws>::connect(&rpc_url)
-    ).await.map_err(|_| anyhow!("Connection handshake timed out"))??;
-    
-    let provider = Arc::new(provider);
+    info!("[{}] Handshaking...", config.name);
+    let provider = Arc::new(Provider::<Ws>::connect(&rpc_url).await?);
     let wallet: LocalWallet = pk.parse()?;
     let chain_id = provider.get_chainid().await?.as_u64();
-    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.clone().with_chain_id(chain_id)));
+    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.with_chain_id(chain_id)));
 
     let fb_client = if !config.flashbots_relay.is_empty() {
         let fb_signer: LocalWallet = "0000000000000000000000000000000000000000000000000000000000000001".parse()?;
@@ -149,7 +130,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
     let mut graph = UnGraph::<Address, PoolEdge>::new_undirected();
     let mut node_map: HashMap<Address, NodeIndex> = HashMap::new();
 
-    // Initial Load
+    // Initial Sync
     let pool_addr = Address::from_str("0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc")?;
     let pair = IUniswapV2Pair::new(pool_addr, provider.clone());
     if let Ok((r0, r1, _)) = pair.get_reserves().call().await {
@@ -161,7 +142,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
         pair_map.insert(pool_addr, idx);
     }
 
-    info!("[{}] Connection Stable. ID: {}. Monitoring logs...", config.name, chain_id);
+    info!("[{}] Chain {} Live. Hunting...", config.name, chain_id);
     let filter = Filter::new().event("Sync(uint112,uint112)");
     let mut stream = provider.subscribe_logs(&filter).await?;
 
@@ -174,8 +155,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
                 }
             }
 
-            let weth_addr = if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } else { WETH_ADDR };
-            let weth = Address::from_str(weth_addr)?;
+            let weth = Address::from_str(if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" })?;
             if let Some(start) = node_map.get(&weth) {
                 if let Some((profit, route)) = find_arb_recursive(&graph, *start, *start, parse_ether("1.0")?, 4, vec![]) {
                     if profit > parse_ether("0.01")? {
@@ -183,8 +163,8 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
                         let bribe = profit * 90 / 100;
                         let strategy = build_strategy(route, parse_ether("1.0")?, bribe, executor.address(), &graph)?;
                         let mut tx = executor.execute(U256::zero(), weth, parse_ether("1.0")?, strategy).tx;
-                        
                         let _ = client.fill_transaction(&mut tx, None).await;
+
                         if let Ok(sig) = client.signer().sign_transaction(&tx).await {
                             let rlp = tx.rlp_signed(&sig);
                             if let Some(fb) = fb_client.as_ref() {
@@ -202,8 +182,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
             }
         }
     }
-    
-    Err(anyhow!("Log stream terminated"))
+    Err(anyhow!("Stream disconnect"))
 }
 
 async fn saturation_strike(rpc_url: &str, signed_rlp: Bytes) {
@@ -235,9 +214,7 @@ fn find_arb_recursive(graph: &UnGraph<Address, PoolEdge>, curr: NodeIndex, start
         if out.is_zero() { continue; }
         let mut next_path = path.clone();
         next_path.push((*graph.node_weight(curr).unwrap(), *graph.node_weight(next).unwrap()));
-        if let Some(res) = find_arb_recursive(graph, next, start, out, depth - 1, next_path) {
-            return Some(res);
-        }
+        if let Some(res) = find_arb_recursive(graph, next, start, out, depth - 1, next_path) { return Some(res); }
     }
     None
 }
@@ -255,8 +232,8 @@ fn build_strategy(route: Vec<(Address, Address)>, init_amt: U256, bribe: U256, c
     let mut payloads = Vec::new();
     let mut curr_in = init_amt;
     for (i, (tin, tout)) in route.iter().enumerate() {
-        let nin = graph.node_indices().find(|node_idx| *graph.node_weight(*node_idx).unwrap() == *tin).unwrap();
-        let nout = graph.node_indices().find(|node_idx| *graph.node_weight(*node_idx).unwrap() == *tout).unwrap();
+        let nin = graph.node_indices().find(|n| *graph.node_weight(*n).unwrap() == *tin).unwrap();
+        let nout = graph.node_indices().find(|n| *graph.node_weight(*n).unwrap() == *tout).unwrap();
         let edge = &graph[graph.find_edge(nin, nout).unwrap()];
         if i == 0 {
             targets.push(*tin);
@@ -267,8 +244,8 @@ fn build_strategy(route: Vec<(Address, Address)>, init_amt: U256, bribe: U256, c
         let out = get_amount_out(curr_in, edge, nin, graph);
         let (a0, a1) = if *tin == edge.token_0 { (U256::zero(), out) } else { (out, U256::zero()) };
         let to = if i == route.len() - 1 { contract } else {
-            let next_node_idx = graph.node_indices().find(|node_idx| *graph.node_weight(*node_idx).unwrap() == route[i+1].1).unwrap();
-            graph[graph.find_edge(nout, next_node_idx).unwrap()].pair_address
+            let next_node_out = graph.node_indices().find(|n| *graph.node_weight(*n).unwrap() == route[i+1].1).unwrap();
+            graph[graph.find_edge(nout, next_node_out).unwrap()].pair_address
         };
         targets.push(edge.pair_address);
         let d = ethers::abi::encode(&[Token::Uint(a0), Token::Uint(a1), Token::Address(to), Token::Bytes(vec![])]);
