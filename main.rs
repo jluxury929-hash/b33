@@ -53,7 +53,6 @@ struct PoolEdge {
 async fn main() {
     // 0. IMMEDIATE LOGGING INIT (Crash Protection)
     dotenv().ok();
-    // Default to 'info' if RUST_LOG is not set
     if env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
     }
@@ -156,7 +155,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
     let client = SignerMiddleware::new(provider.clone(), wallet.clone().with_chain_id(chain_id));
     let client = Arc::new(client);
 
-    // Setup Flashbots (If Relay Exists)
+    // Setup Flashbots
     let fb_client = if !config.flashbots_relay.is_empty() {
         Some(FlashbotsMiddleware::new(
             client.clone(),
@@ -169,15 +168,15 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
 
     let executor = ApexOmega::new(exec_addr.parse::<Address>()?, client.clone());
 
-    // Build Graph (Simplified)
+    // Build Graph
     let mut graph = UnGraph::<Address, PoolEdge>::new_undirected();
     let mut node_map: HashMap<Address, NodeIndex> = HashMap::new();
     let mut pair_map: HashMap<Address, petgraph::graph::EdgeIndex> = HashMap::new();
 
     // WETH Address Logic
-    let weth_addr_str = if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } // Polygon
-                   else if chain_id == 42161 { "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1" } // Arb
-                   else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" }; // Eth/Base
+    let weth_addr_str = if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } 
+                   else if chain_id == 42161 { "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1" } 
+                   else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" };
 
     let pools = vec!["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]; 
 
@@ -233,7 +232,6 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                             strategy_bytes
                         ).tx;
 
-                        // Saturation Broadcast (Dual Channel)
                         if let Some(fb) = fb_client.as_ref() {
                             let block = provider.get_block_number().await?;
                             let bundle = BundleRequest::new()
