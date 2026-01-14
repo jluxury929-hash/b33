@@ -3,7 +3,6 @@ use ethers::{
     providers::{Provider, Ws},
     utils::parse_ether,
     abi::{Token, encode},
-    types::{TransactionRequest, Eip1559TransactionRequest},
 };
 use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
 use petgraph::{graph::{NodeIndex, UnGraph}, visit::EdgeRef};
@@ -13,9 +12,11 @@ use dotenv::dotenv;
 use std::env;
 use anyhow::{Result, anyhow};
 use url::Url;
-use log::{info, warn, error};
+use log::{info, error};
 
-// --- CONFIGURATION STRUCT ---
+// Define concrete client type to avoid generic complexity
+type Client = SignerMiddleware<Provider<Ws>, LocalWallet>;
+
 #[derive(Clone, Debug)]
 struct ChainConfig {
     name: String,
@@ -24,7 +25,6 @@ struct ChainConfig {
     flashbots_relay: String,
 }
 
-// --- ABIGEN INTERFACES ---
 abigen!(
     IUniswapV2Pair,
     r#"[
@@ -51,32 +51,28 @@ struct PoolEdge {
 
 #[tokio::main]
 async fn main() {
-    // 0. IMMEDIATE LOGGING INIT (Crash Protection)
     dotenv().ok();
     if env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
     }
     env_logger::init();
 
-    println!("{}", "╔════════════════════════════════════════════════════════╗".gold());
-    println!("{}", "║    ⚡ APEX OMEGA: SINGULARITY (QUAD-NETWORK)         ║".gold());
-    println!("{}", "║    STATUS: CLOUD GUARD ACTIVE | ZERO-COPY | FLASHBOTS  ║".gold());
-    println!("{}", "╚════════════════════════════════════════════════════════╝".gold());
+    // FIXED: .gold() -> .yellow()
+    println!("{}", "╔════════════════════════════════════════════════════════╗".yellow());
+    println!("{}", "║    ⚡ APEX OMEGA: SINGULARITY (QUAD-NETWORK)         ║".yellow());
+    println!("{}", "║    STATUS: CLOUD GUARD ACTIVE | ZERO-COPY | FLASHBOTS  ║".yellow());
+    println!("{}", "╚════════════════════════════════════════════════════════╝".yellow());
 
-    // 1. WRAP MAIN LOGIC TO CATCH CRASHES
     if let Err(e) = run().await {
         error!("FATAL CRASH: {:?}", e);
-        // Keep process alive for 60s so logs can be read in cloud console
         std::thread::sleep(std::time::Duration::from_secs(60));
         std::process::exit(1);
     }
 }
 
 async fn run() -> Result<()> {
-    // 2. HARDENED VALIDATION
     validate_env()?;
 
-    // 3. CLOUD BOOT GUARD (HEALTH MONITOR)
     thread::spawn(|| {
         let listener = TcpListener::bind("0.0.0.0:8080").expect("Failed to bind port 8080");
         info!("Cloud Health Monitor active on Port 8080");
@@ -88,7 +84,6 @@ async fn run() -> Result<()> {
         }
     });
 
-    // 4. QUAD-NETWORK CONFIGURATION
     let chains = vec![
         ChainConfig {
             name: "ETHEREUM".to_string(),
@@ -119,7 +114,6 @@ async fn run() -> Result<()> {
     let private_key = env::var("PRIVATE_KEY")?;
     let executor_addr = env::var("EXECUTOR_ADDRESS")?;
 
-    // 5. SPAWN CONCURRENT MONITORS
     let mut handles = vec![];
 
     for config in chains {
@@ -134,7 +128,6 @@ async fn run() -> Result<()> {
         handles.push(handle);
     }
 
-    // Keep main process alive
     for h in handles {
         let _ = h.await;
     }
@@ -142,20 +135,16 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-// --- CORE CHAIN LOGIC ---
 async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Result<()> {
     let rpc_url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc);
     info!("[{}] Connecting to {}...", config.name, rpc_url);
     
-    // Setup Provider & Wallet
     let provider = Provider::<Ws>::connect(&rpc_url).await?;
     let provider = Arc::new(provider);
     let wallet: LocalWallet = pk.parse()?;
     let chain_id = provider.get_chainid().await?.as_u64();
-    let client = SignerMiddleware::new(provider.clone(), wallet.clone().with_chain_id(chain_id));
-    let client = Arc::new(client);
+    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.clone().with_chain_id(chain_id)));
 
-    // Setup Flashbots
     let fb_client = if !config.flashbots_relay.is_empty() {
         Some(FlashbotsMiddleware::new(
             client.clone(),
@@ -168,12 +157,10 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
 
     let executor = ApexOmega::new(exec_addr.parse::<Address>()?, client.clone());
 
-    // Build Graph
     let mut graph = UnGraph::<Address, PoolEdge>::new_undirected();
     let mut node_map: HashMap<Address, NodeIndex> = HashMap::new();
     let mut pair_map: HashMap<Address, petgraph::graph::EdgeIndex> = HashMap::new();
 
-    // WETH Address Logic
     let weth_addr_str = if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } 
                    else if chain_id == 42161 { "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1" } 
                    else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" };
@@ -184,9 +171,10 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
     for pool_addr in pools {
         if let Ok(addr) = Address::from_str(pool_addr) {
             let pair = IUniswapV2Pair::new(addr, provider.clone());
+            // FIXED: token_0 and token_1 (snake case)
             if let Ok((r0, r1, _)) = pair.get_reserves().call().await {
-                let t0 = pair.token0().call().await?;
-                let t1 = pair.token1().call().await?;
+                let t0 = pair.token_0().call().await?;
+                let t1 = pair.token_1().call().await?;
 
                 let n0 = *node_map.entry(t0).or_insert_with(|| graph.add_node(t0));
                 let n1 = *node_map.entry(t1).or_insert_with(|| graph.add_node(t1));
@@ -213,7 +201,6 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                 edge.reserve_1 = r1;
             }
 
-            // Infinite Recursive Search
             let weth = Address::from_str(weth_addr_str)?;
             if let Some(start) = node_map.get(&weth) {
                 let amt_in = parse_ether("1.0")?; 
@@ -225,26 +212,34 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                         let bribe = profit * 90 / 100;
                         let strategy_bytes = build_strategy(route, amt_in, bribe, executor.address(), &graph)?;
 
-                        let tx = executor.execute(
+                        // Construct Transaction
+                        let mut tx = executor.execute(
                             U256::zero(), 
                             weth,
                             amt_in,
                             strategy_bytes
                         ).tx;
+                        
+                        // Fill Transaction Details
+                        client.fill_transaction(&mut tx, None).await.ok();
 
-                        if let Some(fb) = fb_client.as_ref() {
-                            let block = provider.get_block_number().await?;
-                            let bundle = BundleRequest::new()
-                                .push_transaction(tx)
-                                .set_block(block + 1)
-                                .set_simulation_block(block)
-                                .set_simulation_timestamp(0);
-                            
-                            fb.send_bundle(&bundle).await.ok();
-                        } else {
-                             // Dual Channel Strike for L2s
-                             let http_url = rpc_url.replace("wss://", "https://").replace("ws://", "http://");
-                             saturation_strike(&client, &http_url, tx).await;
+                        // Sign Transaction (Required for Flashbots Bundle)
+                        if let Ok(signature) = client.signer().sign_transaction(&tx).await {
+                             let rlp_signed_tx = tx.rlp_signed(&signature);
+
+                            if let Some(fb) = fb_client.as_ref() {
+                                let block = provider.get_block_number().await.unwrap_or_default();
+                                let bundle = BundleRequest::new()
+                                    .push_transaction(rlp_signed_tx.clone()) // Pass Signed RLP
+                                    .set_block(block + 1)
+                                    .set_simulation_block(block)
+                                    .set_simulation_timestamp(0);
+                                
+                                fb.send_bundle(&bundle).await.ok();
+                            } else {
+                                 let http_url = rpc_url.replace("wss://", "https://").replace("ws://", "http://");
+                                 saturation_strike(&http_url, rlp_signed_tx).await;
+                            }
                         }
                     }
                 }
@@ -254,29 +249,21 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
     Ok(())
 }
 
-// --- SATURATION STRIKE ---
-async fn saturation_strike<M: Middleware + 'static>(client: &Arc<M>, rpc_url: &str, tx: Eip1559TransactionRequest) {
-    if let Ok(signed_tx) = client.signer().sign_transaction(&tx.clone().into()).await {
-        let raw_tx = signed_tx.rlp();
-        let client_http = reqwest::Client::new();
-        let rpc = rpc_url.to_string();
-        let raw_tx_hex = format!("0x{}", hex::encode(&raw_tx));
-        
-        // Channel 1: HTTP Raw Post
-        tokio::spawn(async move {
-            let body = serde_json::json!({
-                "jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": [raw_tx_hex], "id": 1
-            });
-            let _ = client_http.post(rpc).json(&body).send().await;
+// FIXED: Accepts Raw Bytes (Signed Transaction)
+async fn saturation_strike(rpc_url: &str, raw_tx: Bytes) {
+    let client_http = reqwest::Client::new();
+    let rpc = rpc_url.to_string();
+    let raw_tx_hex = format!("0x{}", hex::encode(&raw_tx));
+    
+    tokio::spawn(async move {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": [raw_tx_hex], "id": 1
         });
-
-        // Channel 2: Standard Provider
-        let _ = client.send_transaction(tx, None).await;
-        info!("🚀 Saturation Strike Sent");
-    }
+        let _ = client_http.post(rpc).json(&body).send().await;
+    });
+    info!("🚀 Saturation Strike Sent");
 }
 
-// --- VALIDATION HELPER ---
 fn validate_env() -> Result<()> {
     let key = env::var("PRIVATE_KEY").map_err(|_| anyhow!("Missing PRIVATE_KEY"))?;
     if key.len() != 64 && !key.starts_with("0x") { return Err(anyhow!("Invalid Private Key Length (Must be 64 chars + 0x)")); }
@@ -285,7 +272,6 @@ fn validate_env() -> Result<()> {
     Ok(())
 }
 
-// --- RECURSIVE DFS ---
 fn find_arb_recursive(
     graph: &UnGraph<Address, PoolEdge>,
     curr: NodeIndex,
@@ -317,16 +303,15 @@ fn find_arb_recursive(
     None
 }
 
-// --- UTILS ---
 fn get_amount_out(amt_in: U256, edge: &PoolEdge, curr: NodeIndex, graph: &UnGraph<Address, PoolEdge>) -> U256 {
     let addr = graph.node_weight(curr).unwrap();
+    // FIXED: Dereference *addr to match &H160 vs H160
     let (r_in, r_out) = if *addr == edge.token_0 { (edge.reserve_0, edge.reserve_1) } else { (edge.reserve_1, edge.reserve_0) };
     if r_in.is_zero() || r_out.is_zero() { return U256::zero(); }
     let amt_fee = amt_in * edge.fee_numerator;
     (amt_fee * r_out) / ((r_in * 1000) + amt_fee)
 }
 
-// --- ZERO-COPY ENCODER ---
 fn build_strategy(
     route: Vec<(Address, Address)>,
     init_amt: U256,
@@ -338,23 +323,24 @@ fn build_strategy(
     let mut payloads = Vec::new();
     let mut curr_in = init_amt;
 
-    let t_sig = [0xa9, 0x05, 0x9c, 0xbb]; // transfer
-    let s_sig = [0x02, 0x2c, 0x0d, 0x9f]; // swap
+    let t_sig = [0xa9, 0x05, 0x9c, 0xbb]; 
+    let s_sig = [0x02, 0x2c, 0x0d, 0x9f]; 
 
     for (i, (tin, tout)) in route.iter().enumerate() {
-        let nin = graph.node_indices().find(|i| *graph.node_weight(*i).unwrap() == tin).unwrap();
-        let nout = graph.node_indices().find(|i| *graph.node_weight(*i).unwrap() == tout).unwrap();
+        let nin = graph.node_indices().find(|i| *graph.node_weight(*i).unwrap() == *tin).unwrap(); // FIXED: *tin
+        let nout = graph.node_indices().find(|i| *graph.node_weight(*i).unwrap() == *tout).unwrap(); // FIXED: *tout
         let edge = &graph[graph.find_edge(nin, nout).unwrap()];
 
         if i == 0 {
-            targets.push(tin);
+            targets.push(*tin); // FIXED: *tin
             let mut d = t_sig.to_vec();
             d.extend(ethers::abi::encode(&[Token::Address(edge.pair_address), Token::Uint(init_amt)]));
             payloads.push(Bytes::from(d));
         }
 
         let out = get_amount_out(curr_in, edge, nin, graph);
-        let (a0, a1) = if tin == edge.token_0 { (U256::zero(), out) } else { (out, U256::zero()) };
+        // FIXED: *tin
+        let (a0, a1) = if *tin == edge.token_0 { (U256::zero(), out) } else { (out, U256::zero()) };
         
         let to = if i == route.len() - 1 { contract } else {
             let (n_next_in, n_next_out) = (nout, graph.node_indices().find(|i| *graph.node_weight(*i).unwrap() == route[i+1].1).unwrap());
@@ -369,9 +355,10 @@ fn build_strategy(
         curr_in = out;
     }
 
+    // FIXED: Iterator Map Closure mismatch by being explicit
     let encoded = encode(&[
-        Token::Array(targets.into_iter().map(Token::Address).collect()),
-        Token::Array(payloads.into_iter().map(Token::Bytes).collect()),
+        Token::Array(targets.into_iter().map(|t| Token::Address(t)).collect()),
+        Token::Array(payloads.into_iter().map(|b| Token::Bytes(b.to_vec())).collect()),
         Token::Uint(bribe),
     ]);
 
