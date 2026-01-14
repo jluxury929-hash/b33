@@ -3,6 +3,7 @@ use ethers::{
     providers::{Provider, Ws},
     utils::parse_ether,
     abi::{Token, encode},
+    types::{TransactionRequest, Eip1559TransactionRequest},
 };
 use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
 use petgraph::{graph::{NodeIndex, UnGraph}, visit::EdgeRef};
@@ -168,12 +169,12 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
 
     let executor = ApexOmega::new(exec_addr.parse::<Address>()?, client.clone());
 
-    // Build Graph
+    // Build Graph (Simplified)
     let mut graph = UnGraph::<Address, PoolEdge>::new_undirected();
     let mut node_map: HashMap<Address, NodeIndex> = HashMap::new();
     let mut pair_map: HashMap<Address, petgraph::graph::EdgeIndex> = HashMap::new();
 
-    // WETH Logic
+    // WETH Address Logic
     let weth_addr_str = if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } // Polygon
                    else if chain_id == 42161 { "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1" } // Arb
                    else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" }; // Eth/Base
@@ -213,6 +214,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                 edge.reserve_1 = r1;
             }
 
+            // Infinite Recursive Search
             let weth = Address::from_str(weth_addr_str)?;
             if let Some(start) = node_map.get(&weth) {
                 let amt_in = parse_ether("1.0")?; 
@@ -231,6 +233,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                             strategy_bytes
                         ).tx;
 
+                        // Saturation Broadcast (Dual Channel)
                         if let Some(fb) = fb_client.as_ref() {
                             let block = provider.get_block_number().await?;
                             let bundle = BundleRequest::new()
@@ -241,7 +244,9 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                             
                             fb.send_bundle(&bundle).await.ok();
                         } else {
-                            client.send_transaction(tx, None).await.ok();
+                             // Dual Channel Strike for L2s
+                             let http_url = rpc_url.replace("wss://", "https://").replace("ws://", "http://");
+                             saturation_strike(&client, &http_url, tx).await;
                         }
                     }
                 }
@@ -249,6 +254,28 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
         }
     }
     Ok(())
+}
+
+// --- SATURATION STRIKE ---
+async fn saturation_strike<M: Middleware + 'static>(client: &Arc<M>, rpc_url: &str, tx: Eip1559TransactionRequest) {
+    if let Ok(signed_tx) = client.signer().sign_transaction(&tx.clone().into()).await {
+        let raw_tx = signed_tx.rlp();
+        let client_http = reqwest::Client::new();
+        let rpc = rpc_url.to_string();
+        let raw_tx_hex = format!("0x{}", hex::encode(&raw_tx));
+        
+        // Channel 1: HTTP Raw Post
+        tokio::spawn(async move {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": [raw_tx_hex], "id": 1
+            });
+            let _ = client_http.post(rpc).json(&body).send().await;
+        });
+
+        // Channel 2: Standard Provider
+        let _ = client.send_transaction(tx, None).await;
+        info!("🚀 Saturation Strike Sent");
+    }
 }
 
 // --- VALIDATION HELPER ---
