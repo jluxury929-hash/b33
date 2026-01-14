@@ -14,7 +14,10 @@ use anyhow::{Result, anyhow};
 use url::Url;
 use log::{info, error, warn};
 use futures_util::StreamExt;
-use rand::Rng; // Add 'rand = "0.8"' to Cargo.toml
+use rand::Rng; 
+
+// --- CONFIGURATION ---
+const WETH_ADDR: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"; 
 
 #[derive(Clone, Debug)]
 struct ChainConfig {
@@ -24,13 +27,19 @@ struct ChainConfig {
     flashbots_relay: String,
 }
 
-abigen!(IUniswapV2Pair, r#"[
-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)
-    function token0() external view returns (address)
-    function token1() external view returns (address)
-]"#);
+abigen!(
+    IUniswapV2Pair,
+    r#"[
+        function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)
+        function token0() external view returns (address)
+        function token1() external view returns (address)
+    ]"#
+);
 
-abigen!(ApexOmega, r#"[ function execute(uint256 mode, address token, uint256 amount, bytes calldata strategy) external payable ]"#);
+abigen!(
+    ApexOmega,
+    r#"[ function execute(uint256 mode, address token, uint256 amount, bytes calldata strategy) external payable ]"#
+);
 
 #[derive(Clone, Copy, Debug)]
 struct PoolEdge {
@@ -63,6 +72,7 @@ async fn main() {
 async fn start_bot() -> Result<()> {
     validate_env()?;
 
+    // Railway Health Monitor
     thread::spawn(|| {
         let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
         for stream in listener.incoming() {
@@ -84,22 +94,26 @@ async fn start_bot() -> Result<()> {
         handles.push(tokio::spawn(async move {
             let mut backoff_secs = 5;
             loop {
-                // STAGGERED START: Each chain waits a random offset to prevent thundering herd
-                let jitter = rand::thread_rng().gen_range(500..3000);
-                tokio::time::sleep(Duration::from_millis(jitter)).await;
+                // 1. STAGGERED START: Each chain waits a random offset to prevent "Thundering Herd" on Infura
+                let jitter_ms = rand::thread_rng().gen_range(1000..5000);
+                tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
 
+                // 2. URL AUTO-FIX (Ensures /ws/ is present)
                 let mut url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc.clone());
-                if url.contains("infura.io") && !url.contains("/ws/") { url = url.replace(".io/v3/", ".io/ws/v3/"); }
+                if url.contains("infura.io") && !url.contains("/ws/") {
+                    url = url.replace(".io/v3/", ".io/ws/v3/");
+                }
 
+                // 3. ATTEMPT CONNECTION
                 match monitor_chain(config.clone(), pk.clone(), exec.clone(), url).await {
                     Ok(_) => {
-                        info!("[{}] Stream ended cleanly. Reconnecting...", config.name);
-                        backoff_secs = 5;
+                        warn!("[{}] Connection closed normally. Reconnecting...", config.name);
+                        backoff_secs = 5; // Reset backoff on successful run
                     },
                     Err(e) => {
                         error!("[{}] CRITICAL FAILURE: {:?}. Backing off for {}s", config.name, e, backoff_secs);
                         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                        // Exponential backoff with a cap of 2 minutes
+                        // Exponential backoff capped at 2 minutes
                         backoff_secs = std::cmp::min(backoff_secs * 2, 120);
                     }
                 }
@@ -112,18 +126,18 @@ async fn start_bot() -> Result<()> {
 }
 
 async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_url: String) -> Result<()> {
-    info!("[{}] Attempting connection...", config.name);
+    info!("[{}] Attempting handshake with {}...", config.name, rpc_url);
     
-    // Handshake Timeout: Don't hang forever if the RPC is lagging
+    // Handshake Timeout: Prevent hanging on busy nodes
     let provider = tokio::time::timeout(
-        Duration::from_secs(10), 
+        Duration::from_secs(15), 
         Provider::<Ws>::connect(&rpc_url)
     ).await.map_err(|_| anyhow!("Connection handshake timed out"))??;
     
     let provider = Arc::new(provider);
     let wallet: LocalWallet = pk.parse()?;
     let chain_id = provider.get_chainid().await?.as_u64();
-    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.with_chain_id(chain_id)));
+    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.clone().with_chain_id(chain_id)));
 
     let fb_client = if !config.flashbots_relay.is_empty() {
         let fb_signer: LocalWallet = "0000000000000000000000000000000000000000000000000000000000000001".parse()?;
@@ -135,7 +149,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
     let mut graph = UnGraph::<Address, PoolEdge>::new_undirected();
     let mut node_map: HashMap<Address, NodeIndex> = HashMap::new();
 
-    // Initial Load Logic
+    // Initial Load
     let pool_addr = Address::from_str("0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc")?;
     let pair = IUniswapV2Pair::new(pool_addr, provider.clone());
     if let Ok((r0, r1, _)) = pair.get_reserves().call().await {
@@ -147,16 +161,59 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
         pair_map.insert(pool_addr, idx);
     }
 
-    info!("[{}] Chain ID {} Verified. Live.", config.name, chain_id);
+    info!("[{}] Connection Stable. ID: {}. Monitoring logs...", config.name, chain_id);
     let filter = Filter::new().event("Sync(uint112,uint112)");
     let mut stream = provider.subscribe_logs(&filter).await?;
 
     while let Some(log) = stream.next().await {
-        // [Logic for arbitrage search...]
-        // Keep this loop as lightweight as possible to avoid 429s on read calls
+        if let Some(edge_idx) = pair_map.get(&log.address) {
+            if let Some(edge) = graph.edge_weight_mut(*edge_idx) {
+                if log.data.len() >= 64 {
+                    edge.reserve_0 = U256::from_big_endian(&log.data[0..32]);
+                    edge.reserve_1 = U256::from_big_endian(&log.data[32..64]);
+                }
+            }
+
+            let weth_addr = if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } else { WETH_ADDR };
+            let weth = Address::from_str(weth_addr)?;
+            if let Some(start) = node_map.get(&weth) {
+                if let Some((profit, route)) = find_arb_recursive(&graph, *start, *start, parse_ether("1.0")?, 4, vec![]) {
+                    if profit > parse_ether("0.01")? {
+                        info!("[{}] 💎 OPPORTUNITY FOUND: {} ETH", config.name, format_ether(profit));
+                        let bribe = profit * 90 / 100;
+                        let strategy = build_strategy(route, parse_ether("1.0")?, bribe, executor.address(), &graph)?;
+                        let mut tx = executor.execute(U256::zero(), weth, parse_ether("1.0")?, strategy).tx;
+                        
+                        let _ = client.fill_transaction(&mut tx, None).await;
+                        if let Ok(sig) = client.signer().sign_transaction(&tx).await {
+                            let rlp = tx.rlp_signed(&sig);
+                            if let Some(fb) = fb_client.as_ref() {
+                                let block = provider.get_block_number().await.unwrap_or_default();
+                                let bundle = BundleRequest::new().push_transaction(rlp).set_block(block + 1);
+                                let fb_cl = fb.clone();
+                                tokio::spawn(async move { let _ = fb_cl.send_bundle(&bundle).await; });
+                            } else {
+                                let http_url = rpc_url.replace("wss://", "https://").replace("ws://", "http://");
+                                saturation_strike(&http_url, rlp).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     
-    Ok(())
+    Err(anyhow!("Log stream terminated"))
+}
+
+async fn saturation_strike(rpc_url: &str, signed_rlp: Bytes) {
+    let client_http = reqwest::Client::new();
+    let rpc = rpc_url.to_string();
+    let raw_tx_hex = format!("0x{}", hex::encode(&signed_rlp));
+    tokio::spawn(async move {
+        let body = serde_json::json!({"jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": [raw_tx_hex], "id": 1});
+        let _ = client_http.post(rpc).json(&body).send().await;
+    });
 }
 
 fn validate_env() -> Result<()> {
@@ -165,4 +222,63 @@ fn validate_env() -> Result<()> {
     Ok(())
 }
 
-// ... [Include find_arb_recursive, get_amount_out, and build_strategy functions here] ...
+fn find_arb_recursive(graph: &UnGraph<Address, PoolEdge>, curr: NodeIndex, start: NodeIndex, amt: U256, depth: u8, path: Vec<(Address, Address)>) -> Option<(U256, Vec<(Address, Address)>)> {
+    if curr == start && path.len() > 1 {
+        let initial = parse_ether("1.0").unwrap();
+        return if amt > initial { Some((amt - initial, path)) } else { None };
+    }
+    if depth == 0 { return None; }
+    for edge in graph.edges(curr) {
+        let next = edge.target();
+        if path.iter().any(|(a, _)| *a == *graph.node_weight(next).unwrap()) && next != start { continue; }
+        let out = get_amount_out(amt, edge.weight(), curr, graph);
+        if out.is_zero() { continue; }
+        let mut next_path = path.clone();
+        next_path.push((*graph.node_weight(curr).unwrap(), *graph.node_weight(next).unwrap()));
+        if let Some(res) = find_arb_recursive(graph, next, start, out, depth - 1, next_path) {
+            return Some(res);
+        }
+    }
+    None
+}
+
+fn get_amount_out(amt_in: U256, edge: &PoolEdge, curr: NodeIndex, graph: &UnGraph<Address, PoolEdge>) -> U256 {
+    let addr = graph.node_weight(curr).unwrap();
+    let (r_in, r_out) = if *addr == edge.token_0 { (edge.reserve_0, edge.reserve_1) } else { (edge.reserve_1, edge.reserve_0) };
+    if r_in.is_zero() || r_out.is_zero() { return U256::zero(); }
+    let amt_fee = amt_in * edge.fee_numerator;
+    (amt_fee * r_out) / ((r_in * 1000) + amt_fee)
+}
+
+fn build_strategy(route: Vec<(Address, Address)>, init_amt: U256, bribe: U256, contract: Address, graph: &UnGraph<Address, PoolEdge>) -> Result<Bytes> {
+    let mut targets = Vec::new();
+    let mut payloads = Vec::new();
+    let mut curr_in = init_amt;
+    for (i, (tin, tout)) in route.iter().enumerate() {
+        let nin = graph.node_indices().find(|node_idx| *graph.node_weight(*node_idx).unwrap() == *tin).unwrap();
+        let nout = graph.node_indices().find(|node_idx| *graph.node_weight(*node_idx).unwrap() == *tout).unwrap();
+        let edge = &graph[graph.find_edge(nin, nout).unwrap()];
+        if i == 0 {
+            targets.push(*tin);
+            let d = ethers::abi::encode(&[Token::Address(edge.pair_address), Token::Uint(init_amt)]);
+            let mut data = vec![0xa9, 0x05, 0x9c, 0xbb]; data.extend(d);
+            payloads.push(Bytes::from(data));
+        }
+        let out = get_amount_out(curr_in, edge, nin, graph);
+        let (a0, a1) = if *tin == edge.token_0 { (U256::zero(), out) } else { (out, U256::zero()) };
+        let to = if i == route.len() - 1 { contract } else {
+            let next_node_idx = graph.node_indices().find(|node_idx| *graph.node_weight(*node_idx).unwrap() == route[i+1].1).unwrap();
+            graph[graph.find_edge(nout, next_node_idx).unwrap()].pair_address
+        };
+        targets.push(edge.pair_address);
+        let d = ethers::abi::encode(&[Token::Uint(a0), Token::Uint(a1), Token::Address(to), Token::Bytes(vec![])]);
+        let mut data = vec![0x02, 0x2c, 0x0d, 0x9f]; data.extend(d);
+        payloads.push(Bytes::from(data));
+        curr_in = out;
+    }
+    Ok(Bytes::from(encode(&[
+        Token::Array(targets.into_iter().map(Token::Address).collect()),
+        Token::Array(payloads.into_iter().map(|b| Token::Bytes(b.to_vec())).collect()),
+        Token::Uint(bribe),
+    ])))
+}
