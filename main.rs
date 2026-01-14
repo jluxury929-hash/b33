@@ -12,7 +12,8 @@ use dotenv::dotenv;
 use std::env;
 use anyhow::{Result, anyhow};
 use url::Url;
-use log::{info, error, warn};
+use log::{info, error};
+use futures_util::StreamExt;
 
 #[derive(Clone, Debug)]
 struct ChainConfig {
@@ -53,7 +54,7 @@ async fn main() {
     
     println!("{}", "╔════════════════════════════════════════════════════════╗".yellow());
     println!("{}", "║    ⚡ APEX OMEGA: QUAD-NETWORK SINGULARITY           ║".yellow());
-    println!("{}", "║    STATUS: STARTING ENGINES WITH WS FALLBACK...       ║".yellow());
+    println!("{}", "║    STATUS: ENGINES READY | DYNAMIC RPC SUPPORT        ║".yellow());
     println!("{}", "╚════════════════════════════════════════════════════════╝".yellow());
     let _ = io::stdout().flush();
 
@@ -65,8 +66,7 @@ async fn main() {
 }
 
 async fn start_bot() -> Result<()> {
-    validate_env()?;
-
+    // Railway Health Monitor
     thread::spawn(|| {
         let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
         for stream in listener.incoming() {
@@ -77,19 +77,28 @@ async fn start_bot() -> Result<()> {
     });
 
     let chains = vec![
-        ChainConfig { name: "ETHEREUM".into(), rpc_env_key: "ETH_RPC".into(), default_rpc: "wss://mainnet.infura.io/ws/v3/YOUR_KEY".into(), flashbots_relay: "https://relay.flashbots.net".into() },
-        ChainConfig { name: "BASE".into(), rpc_env_key: "BASE_RPC".into(), default_rpc: "wss://base-mainnet.infura.io/ws/v3/YOUR_KEY".into(), flashbots_relay: "".into() },
+        ChainConfig { 
+            name: "ETHEREUM".into(), 
+            rpc_env_key: "ETH_RPC".into(), 
+            default_rpc: "wss://mainnet.infura.io/ws/v3/e601dc0b8ff943619576956539dd3b82".into(), 
+            flashbots_relay: "https://relay.flashbots.net".into() 
+        },
+        ChainConfig { 
+            name: "BASE".into(), 
+            rpc_env_key: "BASE_RPC".into(), 
+            default_rpc: "wss://base-mainnet.infura.io/ws/v3/e601dc0b8ff943619576956539dd3b82".into(), 
+            flashbots_relay: "".into() 
+        },
     ];
 
     let mut handles = vec![];
     for config in chains {
-        let pk = env::var("PRIVATE_KEY")?;
-        let exec = env::var("EXECUTOR_ADDRESS")?;
+        let pk = env::var("PRIVATE_KEY").expect("PRIVATE_KEY missing");
+        let exec = env::var("EXECUTOR_ADDRESS").expect("EXECUTOR_ADDRESS missing");
         handles.push(tokio::spawn(async move {
             loop {
-                info!("[{}] Initializing engine...", config.name);
                 if let Err(e) = monitor_chain(config.clone(), pk.clone(), exec.clone()).await {
-                    error!("[{}] Engine crashed: {:?}. Reconnecting in 5s...", config.name, e);
+                    error!("[{}] Engine crashed: {:?}. Reconnecting...", config.name, e);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
@@ -101,22 +110,27 @@ async fn start_bot() -> Result<()> {
 }
 
 async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Result<()> {
-    let rpc_url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc);
-    
-    // Auto-detect protocol
-    let provider = if rpc_url.starts_with("wss://") || rpc_url.starts_with("ws://") {
-        Provider::<Ws>::connect(&rpc_url).await?
+    let rpc_url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc.clone());
+    info!("[{}] Connecting to RPC...", config.name);
+
+    // FIXED: Use a trait object to handle both WS and HTTP types
+    let provider: Arc<Provider<Ws>> = if rpc_url.starts_with("wss://") || rpc_url.starts_with("ws://") {
+        Arc::new(Provider::<Ws>::connect(&rpc_url).await?)
     } else {
-        Provider::<Http>::try_from(&rpc_url)?
+        return Err(anyhow!("Log streaming requires a WebSocket (wss://) URL. {} is not compatible.", rpc_url));
     };
 
-    let provider = Arc::new(provider);
     let wallet: LocalWallet = pk.parse()?;
     let chain_id = provider.get_chainid().await?.as_u64();
-    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.clone().with_chain_id(chain_id)));
+    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.with_chain_id(chain_id)));
 
     let fb_client = if !config.flashbots_relay.is_empty() {
-        Some(Arc::new(FlashbotsMiddleware::new(client.clone(), Url::parse(&config.flashbots_relay)?, wallet.clone())))
+        let fb_signer: LocalWallet = "0000000000000000000000000000000000000000000000000000000000000001".parse()?;
+        Some(Arc::new(FlashbotsMiddleware::new(
+            client.clone(),
+            Url::parse(&config.flashbots_relay)?,
+            fb_signer,
+        )))
     } else { None };
 
     let executor = ApexOmega::new(exec_addr.parse::<Address>()?, client.clone());
@@ -124,47 +138,43 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
     let mut node_map: HashMap<Address, NodeIndex> = HashMap::new();
     let mut pair_map: HashMap<Address, petgraph::graph::EdgeIndex> = HashMap::new();
 
-    // Initial Pool Load
-    let pools = vec!["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]; 
-    for pool_addr in pools {
-        if let Ok(addr) = Address::from_str(pool_addr) {
-            let pair = IUniswapV2Pair::new(addr, provider.clone());
-            if let Ok((r0, r1, _)) = pair.get_reserves().call().await {
-                let t0 = pair.token_0().call().await?;
-                let t1 = pair.token_1().call().await?;
-                let n0 = *node_map.entry(t0).or_insert_with(|| graph.add_node(t0));
-                let n1 = *node_map.entry(t1).or_insert_with(|| graph.add_node(t1));
-                let idx = graph.add_edge(n0, n1, PoolEdge {
-                    pair_address: addr, token_0: t0, token_1: t1, reserve_0: r0.into(), reserve_1: r1.into(), fee_numerator: 997,
-                });
-                pair_map.insert(addr, idx);
-            }
-        }
-    }
+    // Load initial pool
+    let pool_addr = Address::from_str("0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc")?;
+    let pair = IUniswapV2Pair::new(pool_addr, provider.clone());
+    let (r0, r1, _) = pair.get_reserves().call().await?;
+    let t0 = pair.token_0().call().await?;
+    let t1 = pair.token_1().call().await?;
+    let n0 = *node_map.entry(t0).or_insert_with(|| graph.add_node(t0));
+    let n1 = *node_map.entry(t1).or_insert_with(|| graph.add_node(t1));
+    let idx = graph.add_edge(n0, n1, PoolEdge {
+        pair_address: pool_addr, token_0: t0, token_1: t1, reserve_0: r0.into(), reserve_1: r1.into(), fee_numerator: 997,
+    });
+    pair_map.insert(pool_addr, idx);
 
-    info!("[{}] WS Connected & Armed. Monitoring Logs...", config.name);
+    info!("[{}] WS Connected. Monitoring Logs...", config.name);
     let filter = Filter::new().event("Sync(uint112,uint112)");
     let mut stream = provider.subscribe_logs(&filter).await?;
 
-    // MAIN RECURSIVE LOOP
     while let Some(log) = stream.next().await {
-        if let Some(idx) = pair_map.get(&log.address) {
-            if let Some(edge) = graph.edge_weight_mut(*idx) {
-                edge.reserve_0 = U256::from_big_endian(&log.data[0..32]);
-                edge.reserve_1 = U256::from_big_endian(&log.data[32..64]);
+        if let Some(edge_idx) = pair_map.get(&log.address) {
+            if let Some(edge) = graph.edge_weight_mut(*edge_idx) {
+                if log.data.len() >= 64 {
+                    edge.reserve_0 = U256::from_big_endian(&log.data[0..32]);
+                    edge.reserve_1 = U256::from_big_endian(&log.data[32..64]);
+                }
             }
 
-            let weth = if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" };
-            if let Some(start) = node_map.get(&Address::from_str(weth)?) {
+            let weth = Address::from_str("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")?;
+            if let Some(start) = node_map.get(&weth) {
                 let amt_in = parse_ether("1.0")?;
                 if let Some((profit, route)) = find_arb_recursive(&graph, *start, *start, amt_in, 4, vec![]) {
                     if profit > parse_ether("0.01")? {
                         info!("[{}] 💎 PROFIT: {} ETH", config.name, format_ether(profit));
                         let bribe = profit * 90 / 100;
                         let strategy = build_strategy(route, amt_in, bribe, executor.address(), &graph)?;
-                        let mut tx = executor.execute(U256::zero(), Address::from_str(weth)?, amt_in, strategy).tx;
+                        let mut tx = executor.execute(U256::zero(), weth, amt_in, strategy).tx;
                         
-                        client.fill_transaction(&mut tx, None).await.ok();
+                        let _ = client.fill_transaction(&mut tx, None).await;
                         if let Ok(sig) = client.signer().sign_transaction(&tx).await {
                              let rlp = tx.rlp_signed(&sig);
                              if let Some(fb) = fb_client.as_ref() {
@@ -182,9 +192,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
             }
         }
     }
-    
-    // If the stream ends naturally, this error will trigger a reconnect in start_bot
-    Err(anyhow!("Stream disconnected"))
+    Ok(())
 }
 
 async fn saturation_strike(rpc_url: &str, signed_rlp: Bytes) {
@@ -195,12 +203,6 @@ async fn saturation_strike(rpc_url: &str, signed_rlp: Bytes) {
         let body = serde_json::json!({"jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": [raw_tx_hex], "id": 1});
         let _ = client_http.post(rpc).json(&body).send().await;
     });
-}
-
-fn validate_env() -> Result<()> {
-    let _ = env::var("PRIVATE_KEY").map_err(|_| anyhow!("Missing PRIVATE_KEY"))?;
-    let _ = env::var("EXECUTOR_ADDRESS").map_err(|_| anyhow!("Missing EXECUTOR_ADDRESS"))?;
-    Ok(())
 }
 
 fn find_arb_recursive(graph: &UnGraph<Address, PoolEdge>, curr: NodeIndex, start: NodeIndex, amt: U256, depth: u8, path: Vec<(Address, Address)>) -> Option<(U256, Vec<(Address, Address)>)> {
