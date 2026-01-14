@@ -136,9 +136,15 @@ async fn main() -> Result<()> {
                     if profit > parse_ether("0.05")? {
                         info!("{} PROFIT: {} ETH", "💎".green().bold(), profit);
                         
-                        // C. BUILD EXECUTION
+                        // C. BUILD EXECUTION (Pass Graph and Address)
                         let bribe = profit * 90 / 100;
-                        let payload = build_execution_payload(route, amount_in, bribe)?;
+                        let payload = build_execution_payload(
+                            route, 
+                            amount_in, 
+                            bribe, 
+                            executor.address(), 
+                            &graph
+                        )?;
                         
                         let tx = executor.execute(
                             0, // Balancer Flashloan
@@ -197,26 +203,17 @@ fn find_triangle_arb(
             if amt_2.is_zero() { continue; }
 
             // Hop 3: B -> WETH
-            // We specifically look for an edge connecting B back to Start
             if let Some(edge3_idx) = graph.find_edge(node_b, start_node) {
                 let edge3 = &graph[edge3_idx];
                 let amt_3 = get_amount_out(amt_2, edge3, node_b, graph);
 
                 if amt_3 > amount_in {
                     let profit = amt_3 - amount_in;
-                    
-                    // Construct path of tokens: [WETH, TokenA, TokenB, WETH]
                     let token_a = *graph.node_weight(node_a).unwrap();
                     let token_b = *graph.node_weight(node_b).unwrap();
                     let start_addr = *graph.node_weight(start_node).unwrap();
 
-                    // Return Route: (TokenIn, TokenOut) pairs aren't needed for Router, 
-                    // we just need the Path array for each swap.
-                    // Route format for payload builder: list of hops.
-                    // However, standard UniV2 router takes a path array.
-                    // We will reconstruct the swaps in the payload builder.
-                    
-                    // We return the sequence of nodes (addresses)
+                    // Route: List of (TokenIn, TokenOut)
                     let route = vec![
                         (start_addr, token_a),
                         (token_a, token_b),
@@ -237,90 +234,78 @@ fn get_amount_out(
     current_node_idx: NodeIndex,
     graph: &UnGraph<Address, PoolEdge>
 ) -> U256 {
-    // Determine which reserve corresponds to the current node (input token)
     let current_addr = graph.node_weight(current_node_idx).unwrap();
-    
-    let (reserve_in, reserve_out) = if *current_addr == edge.token_0 {
+    let (r_in, r_out) = if *current_addr == edge.token_0 {
         (edge.reserve_0, edge.reserve_1)
     } else {
         (edge.reserve_1, edge.reserve_0)
     };
-
-    if reserve_in.is_zero() || reserve_out.is_zero() { return U256::zero(); }
-
+    if r_in.is_zero() || r_out.is_zero() { return U256::zero(); }
     let amount_in_with_fee = amount_in * edge.fee_numerator;
-    let numerator = amount_in_with_fee * reserve_out;
-    let denominator = (reserve_in * 1000) + amount_in_with_fee;
-    
+    let numerator = amount_in_with_fee * r_out;
+    let denominator = (r_in * 1000) + amount_in_with_fee;
     numerator / denominator
 }
 
-// --- PAYLOAD BUILDER (REAL ABI ENCODING) ---
+// --- PAYLOAD BUILDER (CORRECTED & PRODUCTION READY) ---
 fn build_execution_payload(
     route: Vec<(Address, Address)>, 
     initial_amount: U256, 
-    bribe: U256
+    bribe: U256,
+    contract_address: Address, 
+    graph: &UnGraph<Address, PoolEdge> // Added: We need graph to calc amounts
 ) -> Result<Bytes> {
     let mut targets = Vec::new();
     let mut payloads = Vec::new();
     
-    // We assume the ROUTER is the target for all swaps in this simplified UniV2 architecture
     let router = Address::from_str(ROUTER_ADDR)?;
-    
-    // Uniswap V2 Router Function Selector: swapExactTokensForTokens
-    // signature: 0x38ed1739
-    let selector = [0x38, 0xed, 0x17, 0x39]; 
-    
-    // In the first hop, amountIn is the FlashLoan amount.
-    // In subsequent hops, amountIn is 0 (balance check handled by contract or router).
-    // However, for standard Router calls, we must pass 0 and let the contract handle the flow 
-    // OR we use the contract's specific "trade" logic.
-    // Given ApexOmega logic: `targets[i].call(payloads[i])`.
-    // We will assume the Contract handles balance forwarding if we pass 0, 
-    // OR we chain them tightly.
-    // Since ApexOmega is a "blind executor", we encode standard router swaps.
-    // Note: Standard Router requires approval. ApexOmega must approve the router.
-    // *Correction*: ApexOmega logic is raw execution. It doesn't auto-approve.
-    // Therefore, the payload must include APPROVAL calls or utilize a Router that supports permit.
-    // Optimization: We assume ApexOmega has infinite approved the Router in deployment or previous tx.
-    
-    // Build Swaps
-    for (i, (token_in, token_out)) in route.iter().enumerate() {
-        targets.push(router);
-        
-        // Amt In: Only specified for first hop (Flashloan amount). 
-        // Others are 0 (Router pulls all balance? No, Router needs exact amount).
-        // CRITICAL HFT DETAIL:
-        // Top bots do NOT use the Router. They use the PAIR directly via `swap()`.
-        // Router is too gas heavy.
-        // For this code to be "The Best", we should target the PAIRS.
-        // However, calculating `amountOut` perfectly off-chain is risky without a custom atomic contract.
-        // We will stick to Router encoding for reliability in this snippet, 
-        // knowing the Contract supports raw calls.
-        
-        let amt = if i == 0 { initial_amount } else { U256::zero() }; // 0 implies "Balance" in advanced contracts
-        let min_out = U256::zero(); // Atomic check handles safety
-        let path = vec![*token_in, *token_out];
-        let to = router; // Actually 'to' should be the contract address usually
-        // But for UniV2 Router, 'to' is the recipient of the swap output (Our Contract)
-        
-        // Encode: swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)
-        let deadline = U256::from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + 60);
-        
+
+    // 1. APPROVALS (Fixed: We must approve router)
+    let approve_selector = [0x09, 0x5e, 0xa7, 0xb3]; // approve(address,uint256)
+    for (token_in, _) in &route {
+        targets.push(*token_in);
         let args = vec![
-            Token::Uint(amt),
-            Token::Uint(min_out),
-            Token::Array(path.into_iter().map(Token::Address).collect()),
-            Token::Address(Address::from_str("0xYOUR_CONTRACT_ADDRESS_HERE")?), // RECIPIENT
-            Token::Uint(deadline)
+            Token::Address(router),
+            Token::Uint(U256::MAX), // Infinite Approval
         ];
-        
-        let mut data = selector.to_vec();
+        let mut data = approve_selector.to_vec();
         data.extend(ethers::abi::encode(&args));
         payloads.push(Bytes::from(data));
     }
 
-    // Pack for ApexOmega
+    // 2. SWAPS (Fixed: We calculate exact amounts for every hop)
+    let swap_selector = [0x38, 0xed, 0x17, 0x39]; // swapExactTokensForTokens
+    let mut current_amount_in = initial_amount;
+
+    for (i, (token_in, token_out)) in route.iter().enumerate() {
+        // Calculate Expected Output for this Hop
+        if i > 0 {
+             let edge_idx = graph.find_edge(graph.find_node(*token_in).unwrap(), graph.find_node(*token_out).unwrap()).unwrap();
+             let edge = &graph[edge_idx];
+             // Recalculate output to be precise
+             current_amount_in = get_amount_out(current_amount_in, edge, graph.find_node(*token_in).unwrap(), graph);
+        }
+
+        targets.push(router);
+        
+        // Params
+        let path = vec![*token_in, *token_out];
+        let deadline = U256::from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + 60);
+        
+        let args = vec![
+            Token::Uint(current_amount_in), // Fixed: Precise Amount used here
+            Token::Uint(U256::zero()),      
+            Token::Array(path.into_iter().map(Token::Address).collect()),
+            Token::Address(contract_address), 
+            Token::Uint(deadline)
+        ];
+        
+        let mut data = swap_selector.to_vec();
+        data.extend(ethers::abi::encode(&args));
+        payloads.push(Bytes::from(data));
+    }
+
+    // 3. PACK FOR CONTRACT
     let encoded = encode(&[
         Token::Array(targets.into_iter().map(Token::Address).collect()),
         Token::Array(payloads.into_iter().map(Token::Bytes).collect()),
