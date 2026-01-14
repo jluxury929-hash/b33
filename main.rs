@@ -14,7 +14,12 @@ use anyhow::{Result, anyhow};
 use url::Url;
 use log::{info, error, warn};
 use futures_util::StreamExt;
-use rand::Rng;
+use tokio::sync::Mutex;
+
+// GLOBAL LOCK: Ensures only one chain handshakes at a time
+lazy_static::lazy_static! {
+    static ref HANDSHAKE_LOCK: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+}
 
 #[derive(Clone, Debug)]
 struct ChainConfig {
@@ -22,7 +27,6 @@ struct ChainConfig {
     rpc_env_key: String,
     default_rpc: String,
     flashbots_relay: String,
-    stagger_delay: u64, // Staggered start to prevent 429s
 }
 
 abigen!(IUniswapV2Pair, r#"[
@@ -49,8 +53,8 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
     println!("{}", "╔════════════════════════════════════════════════════════╗".yellow());
-    println!("{}", "║    ⚡ APEX OMEGA: FINAL SINGULARITY (V4.1)          ║".yellow());
-    println!("{}", "║    STATUS: ANTI-BAN JITTER ACTIVE | QUAD-CORE       ║".yellow());
+    println!("{}", "║    ⚡ APEX OMEGA: SEQUENTIAL SINGULARITY (V4.2)     ║".yellow());
+    println!("{}", "║    STATUS: COLD-START LOCK ACTIVE | ANTI-BAN        ║".yellow());
     println!("{}", "╚════════════════════════════════════════════════════════╝".yellow());
     let _ = io::stdout().flush();
 
@@ -64,7 +68,7 @@ async fn main() {
 async fn start_bot() -> Result<()> {
     validate_env()?;
 
-    // Port 8080 Guard for Railway
+    // Railway Health Guard
     thread::spawn(|| {
         let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
         for stream in listener.incoming() {
@@ -73,38 +77,42 @@ async fn start_bot() -> Result<()> {
     });
 
     let chains = vec![
-        ChainConfig { name: "ETHEREUM".into(), rpc_env_key: "ETH_RPC".into(), default_rpc: "wss://mainnet.infura.io/ws/v3/PROJECT_ID".into(), flashbots_relay: "https://relay.flashbots.net".into(), stagger_delay: 0 },
-        ChainConfig { name: "BASE".into(), rpc_env_key: "BASE_RPC".into(), default_rpc: "wss://base-mainnet.infura.io/ws/v3/PROJECT_ID".into(), flashbots_relay: "".into(), stagger_delay: 20 },
-        ChainConfig { name: "ARBITRUM".into(), rpc_env_key: "ARB_RPC".into(), default_rpc: "wss://arbitrum-mainnet.infura.io/ws/v3/PROJECT_ID".into(), flashbots_relay: "".into(), stagger_delay: 40 },
+        ChainConfig { name: "ETHEREUM".into(), rpc_env_key: "ETH_RPC".into(), default_rpc: "wss://mainnet.infura.io/ws/v3/ID".into(), flashbots_relay: "https://relay.flashbots.net".into() },
+        ChainConfig { name: "BASE".into(), rpc_env_key: "BASE_RPC".into(), default_rpc: "wss://base-mainnet.infura.io/ws/v3/ID".into(), flashbots_relay: "".into() },
+        ChainConfig { name: "ARBITRUM".into(), rpc_env_key: "ARB_RPC".into(), default_rpc: "wss://arbitrum-mainnet.infura.io/ws/v3/ID".into(), flashbots_relay: "".into() },
     ];
 
     let mut handles = vec![];
     for config in chains {
         let pk = env::var("PRIVATE_KEY")?;
         let exec = env::var("EXECUTOR_ADDRESS")?;
+        
         handles.push(tokio::spawn(async move {
-            if config.stagger_delay > 0 {
-                tokio::time::sleep(Duration::from_secs(config.stagger_delay)).await;
-            }
-            let mut backoff = 10;
+            let mut backoff = 15;
             loop {
+                // SEQUENTIAL LOCK: Threads will wait here and handshake one-by-one
+                let _lock = HANDSHAKE_LOCK.lock().await;
+                
                 let mut url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc.clone());
-                if url.contains("infura.io") && !url.contains("/ws/") { url = url.replace(".io/v3/", ".io/ws/v3/"); }
+                if url.contains("infura.io") && !url.contains("/ws/") { 
+                    url = url.replace(".io/v3/", ".io/ws/v3/"); 
+                }
 
                 match monitor_chain(config.clone(), pk.clone(), exec.clone(), url).await {
-                    Ok(_) => backoff = 10,
+                    Ok(_) => backoff = 15,
                     Err(e) => {
                         let err_msg = format!("{:?}", e);
                         if err_msg.contains("429") || err_msg.contains("-32005") {
-                            error!("[{}] BANNED BY INFURA. Entering deep sleep (5m) to clear IP.", config.name);
+                            error!("[{}] BANNED. Cool down for 5m to clear IP.", config.name);
                             tokio::time::sleep(Duration::from_secs(300)).await;
                         } else {
-                            error!("[{}] Error: {}. Backoff {}s", config.name, err_msg, backoff);
+                            error!("[{}] Failed: {}. Backoff {}s", config.name, err_msg, backoff);
                             tokio::time::sleep(Duration::from_secs(backoff)).await;
-                            backoff = std::cmp::min(backoff * 2, 60);
+                            backoff = std::cmp::min(backoff * 2, 120);
                         }
                     }
                 }
+                // Release lock happens here automatically
             }
         }));
     }
@@ -114,8 +122,12 @@ async fn start_bot() -> Result<()> {
 }
 
 async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_url: String) -> Result<()> {
-    info!("[{}] Handshaking...", config.name);
-    let provider = Arc::new(Provider::<Ws>::connect(&rpc_url).await?);
+    info!("[{}] Initializing Sequential Handshake...", config.name);
+    
+    let provider = tokio::time::timeout(Duration::from_secs(45), Provider::<Ws>::connect(&rpc_url))
+        .await.map_err(|_| anyhow!("Handshake Timeout"))??;
+    
+    let provider = Arc::new(provider);
     let wallet: LocalWallet = pk.parse()?;
     let chain_id = provider.get_chainid().await?.as_u64();
     let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.with_chain_id(chain_id)));
@@ -130,7 +142,7 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
     let mut graph = UnGraph::<Address, PoolEdge>::new_undirected();
     let mut node_map: HashMap<Address, NodeIndex> = HashMap::new();
 
-    // Initial Sync
+    // Load initial sync data
     let pool_addr = Address::from_str("0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc")?;
     let pair = IUniswapV2Pair::new(pool_addr, provider.clone());
     if let Ok((r0, r1, _)) = pair.get_reserves().call().await {
@@ -142,47 +154,53 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_u
         pair_map.insert(pool_addr, idx);
     }
 
-    info!("[{}] Chain {} Live. Hunting...", config.name, chain_id);
+    info!("[{}] Handshake Complete. ChainID: {}. Hunting...", config.name, chain_id);
     let filter = Filter::new().event("Sync(uint112,uint112)");
     let mut stream = provider.subscribe_logs(&filter).await?;
 
-    while let Some(log) = stream.next().await {
-        if let Some(edge_idx) = pair_map.get(&log.address) {
-            if let Some(edge) = graph.edge_weight_mut(*edge_idx) {
-                if log.data.len() >= 64 {
-                    edge.reserve_0 = U256::from_big_endian(&log.data[0..32]);
-                    edge.reserve_1 = U256::from_big_endian(&log.data[32..64]);
-                }
-            }
+    loop {
+        // HEARTBEAT PROTECTION: Reconnect if no data for 60s
+        let log_result = tokio::time::timeout(Duration::from_secs(60), stream.next()).await;
+        
+        match log_result {
+            Ok(Some(log)) => {
+                if let Some(edge_idx) = pair_map.get(&log.address) {
+                    if let Some(edge) = graph.edge_weight_mut(*edge_idx) {
+                        if log.data.len() >= 64 {
+                            edge.reserve_0 = U256::from_big_endian(&log.data[0..32]);
+                            edge.reserve_1 = U256::from_big_endian(&log.data[32..64]);
+                        }
+                    }
 
-            let weth = Address::from_str(if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" })?;
-            if let Some(start) = node_map.get(&weth) {
-                if let Some((profit, route)) = find_arb_recursive(&graph, *start, *start, parse_ether("1.0")?, 4, vec![]) {
-                    if profit > parse_ether("0.01")? {
-                        info!("[{}] 💎 OPPORTUNITY FOUND: {} ETH", config.name, format_ether(profit));
-                        let bribe = profit * 90 / 100;
-                        let strategy = build_strategy(route, parse_ether("1.0")?, bribe, executor.address(), &graph)?;
-                        let mut tx = executor.execute(U256::zero(), weth, parse_ether("1.0")?, strategy).tx;
-                        let _ = client.fill_transaction(&mut tx, None).await;
+                    let weth = Address::from_str(if chain_id == 137 { "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" } else { "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" })?;
+                    if let Some(start) = node_map.get(&weth) {
+                        if let Some((profit, route)) = find_arb_recursive(&graph, *start, *start, parse_ether("1.0")?, 4, vec![]) {
+                            if profit > parse_ether("0.01")? {
+                                info!("[{}] 💎 PROFIT: {} ETH", config.name, format_ether(profit));
+                                let strategy = build_strategy(route, parse_ether("1.0")?, (profit * 90 / 100), executor.address(), &graph)?;
+                                let mut tx = executor.execute(U256::zero(), weth, parse_ether("1.0")?, strategy).tx;
+                                let _ = client.fill_transaction(&mut tx, None).await;
 
-                        if let Ok(sig) = client.signer().sign_transaction(&tx).await {
-                            let rlp = tx.rlp_signed(&sig);
-                            if let Some(fb) = fb_client.as_ref() {
-                                let block = provider.get_block_number().await.unwrap_or_default();
-                                let bundle = BundleRequest::new().push_transaction(rlp).set_block(block + 1);
-                                let fb_cl = fb.clone();
-                                tokio::spawn(async move { let _ = fb_cl.send_bundle(&bundle).await; });
-                            } else {
-                                let http_url = rpc_url.replace("wss://", "https://").replace("ws://", "http://");
-                                saturation_strike(&http_url, rlp).await;
+                                if let Ok(sig) = client.signer().sign_transaction(&tx).await {
+                                    let rlp = tx.rlp_signed(&sig);
+                                    if let Some(fb) = fb_client.as_ref() {
+                                        let bundle = BundleRequest::new().push_transaction(rlp).set_block(provider.get_block_number().await.unwrap_or_default() + 1);
+                                        let fb_cl = fb.clone();
+                                        tokio::spawn(async move { let _ = fb_cl.send_bundle(&bundle).await; });
+                                    } else {
+                                        let http_url = rpc_url.replace("wss://", "https://").replace("ws://", "http://");
+                                        saturation_strike(&http_url, rlp).await;
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            }
+            },
+            Ok(None) => return Err(anyhow!("Stream ended")),
+            Err(_) => return Err(anyhow!("Heartbeat Timeout")),
         }
     }
-    Err(anyhow!("Stream disconnect"))
 }
 
 async fn saturation_strike(rpc_url: &str, signed_rlp: Bytes) {
