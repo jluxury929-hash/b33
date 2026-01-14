@@ -6,13 +6,13 @@ use ethers::{
 };
 use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
 use petgraph::{graph::{NodeIndex, UnGraph}, visit::EdgeRef};
-use std::{sync::Arc, collections::HashMap, str::FromStr, net::TcpListener, io::{self, Write}, thread};
+use std::{sync::Arc, collections::HashMap, str::FromStr, net::TcpListener, io::{self, Write}, thread, time::Duration};
 use colored::*;
 use dotenv::dotenv;
 use std::env;
 use anyhow::{Result, anyhow};
 use url::Url;
-use log::{info, error};
+use log::{info, error, warn};
 
 #[derive(Clone, Debug)]
 struct ChainConfig {
@@ -53,13 +53,13 @@ async fn main() {
     
     println!("{}", "╔════════════════════════════════════════════════════════╗".yellow());
     println!("{}", "║    ⚡ APEX OMEGA: QUAD-NETWORK SINGULARITY           ║".yellow());
-    println!("{}", "║    STATUS: STARTING ENGINES...                         ║".yellow());
+    println!("{}", "║    STATUS: STARTING ENGINES WITH WS FALLBACK...       ║".yellow());
     println!("{}", "╚════════════════════════════════════════════════════════╝".yellow());
     let _ = io::stdout().flush();
 
     if let Err(e) = start_bot().await {
         error!("FATAL STARTUP ERROR: {:?}", e);
-        thread::sleep(std::time::Duration::from_secs(5));
+        thread::sleep(Duration::from_secs(5));
         std::process::exit(1);
     }
 }
@@ -67,7 +67,6 @@ async fn main() {
 async fn start_bot() -> Result<()> {
     validate_env()?;
 
-    // Health Monitor for Railway
     thread::spawn(|| {
         let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
         for stream in listener.incoming() {
@@ -87,8 +86,12 @@ async fn start_bot() -> Result<()> {
         let pk = env::var("PRIVATE_KEY")?;
         let exec = env::var("EXECUTOR_ADDRESS")?;
         handles.push(tokio::spawn(async move {
-            if let Err(e) = monitor_chain(config.clone(), pk, exec).await {
-                error!("[{}] Chain Died: {:?}", config.name, e);
+            loop {
+                info!("[{}] Initializing engine...", config.name);
+                if let Err(e) = monitor_chain(config.clone(), pk.clone(), exec.clone()).await {
+                    error!("[{}] Engine crashed: {:?}. Reconnecting in 5s...", config.name, e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             }
         }));
     }
@@ -99,9 +102,8 @@ async fn start_bot() -> Result<()> {
 
 async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Result<()> {
     let rpc_url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc);
-    info!("[{}] Connecting to {}...", config.name, rpc_url);
     
-    // FIX: Hybrid Connection Handler (Detects WSS vs HTTPS automatically)
+    // Auto-detect protocol
     let provider = if rpc_url.starts_with("wss://") || rpc_url.starts_with("ws://") {
         Provider::<Ws>::connect(&rpc_url).await?
     } else {
@@ -122,10 +124,29 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
     let mut node_map: HashMap<Address, NodeIndex> = HashMap::new();
     let mut pair_map: HashMap<Address, petgraph::graph::EdgeIndex> = HashMap::new();
 
-    info!("[{}] Armed. Subscribing to Logs...", config.name);
+    // Initial Pool Load
+    let pools = vec!["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]; 
+    for pool_addr in pools {
+        if let Ok(addr) = Address::from_str(pool_addr) {
+            let pair = IUniswapV2Pair::new(addr, provider.clone());
+            if let Ok((r0, r1, _)) = pair.get_reserves().call().await {
+                let t0 = pair.token_0().call().await?;
+                let t1 = pair.token_1().call().await?;
+                let n0 = *node_map.entry(t0).or_insert_with(|| graph.add_node(t0));
+                let n1 = *node_map.entry(t1).or_insert_with(|| graph.add_node(t1));
+                let idx = graph.add_edge(n0, n1, PoolEdge {
+                    pair_address: addr, token_0: t0, token_1: t1, reserve_0: r0.into(), reserve_1: r1.into(), fee_numerator: 997,
+                });
+                pair_map.insert(addr, idx);
+            }
+        }
+    }
+
+    info!("[{}] WS Connected & Armed. Monitoring Logs...", config.name);
     let filter = Filter::new().event("Sync(uint112,uint112)");
     let mut stream = provider.subscribe_logs(&filter).await?;
 
+    // MAIN RECURSIVE LOOP
     while let Some(log) = stream.next().await {
         if let Some(idx) = pair_map.get(&log.address) {
             if let Some(edge) = graph.edge_weight_mut(*idx) {
@@ -161,7 +182,9 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
             }
         }
     }
-    Ok(())
+    
+    // If the stream ends naturally, this error will trigger a reconnect in start_bot
+    Err(anyhow!("Stream disconnected"))
 }
 
 async fn saturation_strike(rpc_url: &str, signed_rlp: Bytes) {
