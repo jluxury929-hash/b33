@@ -14,7 +14,7 @@ use anyhow::{Result, anyhow};
 use url::Url;
 use log::{info, error};
 
-// Define concrete client type to avoid generic complexity
+// Define concrete client type
 type Client = SignerMiddleware<Provider<Ws>, LocalWallet>;
 
 #[derive(Clone, Debug)]
@@ -57,7 +57,6 @@ async fn main() {
     }
     env_logger::init();
 
-    // FIXED: .gold() -> .yellow()
     println!("{}", "╔════════════════════════════════════════════════════════╗".yellow());
     println!("{}", "║    ⚡ APEX OMEGA: SINGULARITY (QUAD-NETWORK)         ║".yellow());
     println!("{}", "║    STATUS: CLOUD GUARD ACTIVE | ZERO-COPY | FLASHBOTS  ║".yellow());
@@ -171,7 +170,6 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
     for pool_addr in pools {
         if let Ok(addr) = Address::from_str(pool_addr) {
             let pair = IUniswapV2Pair::new(addr, provider.clone());
-            // FIXED: token_0 and token_1 (snake case)
             if let Ok((r0, r1, _)) = pair.get_reserves().call().await {
                 let t0 = pair.token_0().call().await?;
                 let t1 = pair.token_1().call().await?;
@@ -212,7 +210,6 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                         let bribe = profit * 90 / 100;
                         let strategy_bytes = build_strategy(route, amt_in, bribe, executor.address(), &graph)?;
 
-                        // Construct Transaction
                         let mut tx = executor.execute(
                             U256::zero(), 
                             weth,
@@ -220,17 +217,15 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                             strategy_bytes
                         ).tx;
                         
-                        // Fill Transaction Details
                         client.fill_transaction(&mut tx, None).await.ok();
 
-                        // Sign Transaction (Required for Flashbots Bundle)
                         if let Ok(signature) = client.signer().sign_transaction(&tx).await {
                              let rlp_signed_tx = tx.rlp_signed(&signature);
 
                             if let Some(fb) = fb_client.as_ref() {
                                 let block = provider.get_block_number().await.unwrap_or_default();
                                 let bundle = BundleRequest::new()
-                                    .push_transaction(rlp_signed_tx.clone()) // Pass Signed RLP
+                                    .push_transaction(rlp_signed_tx.clone())
                                     .set_block(block + 1)
                                     .set_simulation_block(block)
                                     .set_simulation_timestamp(0);
@@ -249,7 +244,6 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
     Ok(())
 }
 
-// FIXED: Accepts Raw Bytes (Signed Transaction)
 async fn saturation_strike(rpc_url: &str, raw_tx: Bytes) {
     let client_http = reqwest::Client::new();
     let rpc = rpc_url.to_string();
@@ -278,7 +272,7 @@ fn find_arb_recursive(
     start: NodeIndex,
     amt: U256,
     depth: u8,
-    mut path: Vec<(Address, Address)>
+    path: Vec<(Address, Address)> // Removed mut to fix warning
 ) -> Option<(U256, Vec<(Address, Address)>)> {
     if curr == start && path.len() > 1 {
         let initial = parse_ether("1.0").unwrap();
@@ -305,7 +299,6 @@ fn find_arb_recursive(
 
 fn get_amount_out(amt_in: U256, edge: &PoolEdge, curr: NodeIndex, graph: &UnGraph<Address, PoolEdge>) -> U256 {
     let addr = graph.node_weight(curr).unwrap();
-    // FIXED: Dereference *addr to match &H160 vs H160
     let (r_in, r_out) = if *addr == edge.token_0 { (edge.reserve_0, edge.reserve_1) } else { (edge.reserve_1, edge.reserve_0) };
     if r_in.is_zero() || r_out.is_zero() { return U256::zero(); }
     let amt_fee = amt_in * edge.fee_numerator;
@@ -327,23 +320,24 @@ fn build_strategy(
     let s_sig = [0x02, 0x2c, 0x0d, 0x9f]; 
 
     for (i, (tin, tout)) in route.iter().enumerate() {
-        let nin = graph.node_indices().find(|i| *graph.node_weight(*i).unwrap() == *tin).unwrap(); // FIXED: *tin
-        let nout = graph.node_indices().find(|i| *graph.node_weight(*i).unwrap() == *tout).unwrap(); // FIXED: *tout
+        // FIXED: Renamed internal loop variables to 'node_idx' to avoid shadowing outer 'i'
+        let nin = graph.node_indices().find(|node_idx| *graph.node_weight(*node_idx).unwrap() == *tin).unwrap(); 
+        let nout = graph.node_indices().find(|node_idx| *graph.node_weight(*node_idx).unwrap() == *tout).unwrap();
         let edge = &graph[graph.find_edge(nin, nout).unwrap()];
 
         if i == 0 {
-            targets.push(*tin); // FIXED: *tin
+            targets.push(*tin);
             let mut d = t_sig.to_vec();
             d.extend(ethers::abi::encode(&[Token::Address(edge.pair_address), Token::Uint(init_amt)]));
             payloads.push(Bytes::from(d));
         }
 
         let out = get_amount_out(curr_in, edge, nin, graph);
-        // FIXED: *tin
         let (a0, a1) = if *tin == edge.token_0 { (U256::zero(), out) } else { (out, U256::zero()) };
         
+        // FIXED: Now we can safely use route[i+1] because 'i' refers to the outer loop count
         let to = if i == route.len() - 1 { contract } else {
-            let (n_next_in, n_next_out) = (nout, graph.node_indices().find(|i| *graph.node_weight(*i).unwrap() == route[i+1].1).unwrap());
+            let (n_next_in, n_next_out) = (nout, graph.node_indices().find(|node_idx| *graph.node_weight(*node_idx).unwrap() == route[i+1].1).unwrap());
             graph[graph.find_edge(n_next_in, n_next_out).unwrap()].pair_address
         };
 
@@ -355,7 +349,6 @@ fn build_strategy(
         curr_in = out;
     }
 
-    // FIXED: Iterator Map Closure mismatch by being explicit
     let encoded = encode(&[
         Token::Array(targets.into_iter().map(|t| Token::Address(t)).collect()),
         Token::Array(payloads.into_iter().map(|b| Token::Bytes(b.to_vec())).collect()),
