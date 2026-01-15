@@ -52,13 +52,13 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
     println!("{}", "╔════════════════════════════════════════════════════════╗".yellow());
-    println!("{}", "║    ⚡ APEX OMEGA: PAID-TIER OPTIMIZED (V4.2.7)      ║".yellow().bold());
-    println!("{}", "║    STATUS: HIGH-THROUGHPUT | MULTI-KEY READY        ║".yellow());
+    println!("{}", "║    ⚡ APEX OMEGA: SERIALIZED RESILIENCE (V4.2.4)   ║".yellow().bold());
+    println!("{}", "║    STATUS: INFURA-HARDENED | QUOTA CONSERVATIVE     ║".yellow());
     println!("{}", "╚════════════════════════════════════════════════════════╝".yellow());
 
     if let Err(e) = start_bot().await {
         error!("FATAL STARTUP ERROR: {:?}", e);
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(Duration::from_secs(10));
         std::process::exit(1);
     }
 }
@@ -74,8 +74,8 @@ async fn start_bot() -> Result<()> {
         }
     });
 
-    // Semaphore: Set to 3 for Paid Plans (Allows all chains to connect simultaneously)
-    let handshake_semaphore = Arc::new(Semaphore::new(3));
+    // Semaphore: ONLY 1 chain can handshake at a time to prevent IP 429s
+    let handshake_semaphore = Arc::new(Semaphore::new(1));
 
     let chains = vec![
         ChainConfig { name: "ETHEREUM".into(), rpc_env_key: "ETH_RPC".into(), default_rpc: "wss://mainnet.infura.io/ws/v3/ID".into(), flashbots_relay: "https://relay.flashbots.net".into(), chain_id: 1 },
@@ -90,16 +90,25 @@ async fn start_bot() -> Result<()> {
             let pk = env::var("PRIVATE_KEY").unwrap();
             let exec = env::var("EXECUTOR_ADDRESS").unwrap();
             
+            let mut backoff = 60; // Start with 1 min backoff for Infura 429s
             loop {
+                // Wait for the semaphore before connecting
                 let permit = semaphore.acquire().await.unwrap();
+                info!("[{}] Semaphore Acquired. Establishing Link...", config.name);
+
                 let rpc_url = env::var(&config.rpc_env_key).unwrap_or(config.default_rpc.clone());
 
                 match monitor_chain(config.clone(), pk.clone(), exec.clone(), rpc_url).await {
-                    Ok(_) => { drop(permit); tokio::time::sleep(Duration::from_secs(5)).await; },
+                    Ok(_) => {
+                        drop(permit); // Release immediately on graceful exit
+                        backoff = 60;
+                    },
                     Err(e) => {
-                        drop(permit);
-                        error!("[{}] Fail: {:?}. Rotating/Retrying...", config.name, e);
-                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        drop(permit); // Release so other chains can try while this one backs off
+                        let err_msg = format!("{:?}", e);
+                        error!("[{}] Connection Failed: {}. Sleep {}s", config.name, err_msg, backoff);
+                        tokio::time::sleep(Duration::from_secs(backoff)).await;
+                        backoff = std::cmp::min(backoff * 2, 600);
                     }
                 }
             }
@@ -111,41 +120,38 @@ async fn start_bot() -> Result<()> {
 }
 
 async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String, rpc_url: String) -> Result<()> {
-    // 1. WebSocket Handshake (Paid tier is faster)
-    let provider = tokio::time::timeout(Duration::from_secs(15), Provider::<Ws>::connect(&rpc_url))
+    // 1. WebSocket Connection
+    let provider = tokio::time::timeout(Duration::from_secs(30), Provider::<Ws>::connect(&rpc_url))
         .await.map_err(|_| anyhow!("Handshake Timeout"))??;
     
-    // 2. Micro-Settle Delay (1s instead of 5s)
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // 2. LONG SETTLE DELAY (Critical for Infura 429 prevention)
+    tokio::time::sleep(Duration::from_millis(5000)).await;
 
     let provider = Arc::new(provider);
     let wallet: LocalWallet = pk.parse()?;
     
-    // 3. Static Chain ID to save credits
+    // 3. STATIC CHAIN ID (Saves 1 request credit per handshake)
     let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet.with_chain_id(config.chain_id)));
 
-    info!("[{}] Link Live. High-Throughput Mode Active.", config.name);
+    info!("[{}] Hardened Link Ready (Chain {}). Subscribing...", config.name, config.chain_id);
 
     let filter = Filter::new().event("Sync(uint112,uint112)");
     let mut stream = provider.subscribe_logs(&filter).await?;
 
     loop {
-        match tokio::time::timeout(Duration::from_secs(60), stream.next()).await {
+        match tokio::time::timeout(Duration::from_secs(120), stream.next()).await {
             Ok(Some(log)) => {
                 print!("{}", ".".black());
                 let _ = io::stdout().flush();
-                
-                // MEV MATH GOES HERE
-                
-                // 4. MICRO-THROTTLE: Prevents 429 during high-volume spikes
-                // 10ms delay is enough to keep Infura happy without losing competitive edge
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                // ... Arb Logic ...
             },
-            Ok(None) => return Err(anyhow!("Stream end")),
-            Err(_) => return Err(anyhow!("Timeout")),
+            Ok(None) => return Err(anyhow!("Stream ended")),
+            Err(_) => return Err(anyhow!("Stream timeout")),
         }
     }
 }
+
+// ... (find_arb_recursive, get_amount_out, validate_env remain the same) ...
 
 fn validate_env() -> Result<()> {
     let _ = env::var("PRIVATE_KEY")?;
